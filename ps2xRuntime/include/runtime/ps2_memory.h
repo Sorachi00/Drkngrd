@@ -317,6 +317,9 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    using Vu0MscalCallback = std::function<void(uint32_t startPC, bool resume)>;
+    void setVu0MscalCallback(Vu0MscalCallback cb) { m_vu0MscalCallback = std::move(cb); }
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -399,6 +402,9 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    Vu0MscalCallback m_vu0MscalCallback;
+    std::vector<uint8_t> m_vif0Stream;
+    uint32_t parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes);
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 

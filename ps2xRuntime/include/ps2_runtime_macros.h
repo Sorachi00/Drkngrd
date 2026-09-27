@@ -140,10 +140,137 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PXOR(a, b) _mm_xor_si128((__m128i)(a), (__m128i)(b))
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
+
+#define PS2_FLOAT_MAX_BITS 0x7F7FFFFFu
+#define PS2_FLOAT_EXP_MASK 0x7F800000u
+#define PS2_FLOAT_SIGN_MASK 0x80000000u
+
+static inline __m128 Ps2VuNormalize(__m128 v)
+{
+    const __m128i bits = _mm_castps_si128(v);
+    const __m128i expMask = _mm_set1_epi32((int)PS2_FLOAT_EXP_MASK);
+    const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32((int)PS2_FLOAT_SIGN_MASK));
+    const __m128i exponent = _mm_and_si128(bits, expMask);
+    const __m128i isSubnormal = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+    const __m128i isOverflow = _mm_cmpeq_epi32(exponent, expMask);
+    const __m128i saturated = _mm_or_si128(sign, _mm_set1_epi32((int)PS2_FLOAT_MAX_BITS));
+
+    __m128i out = _mm_or_si128(_mm_andnot_si128(isSubnormal, bits),
+                               _mm_and_si128(isSubnormal, sign));
+    out = _mm_or_si128(_mm_andnot_si128(isOverflow, out),
+                       _mm_and_si128(isOverflow, saturated));
+    return _mm_castsi128_ps(out);
+}
+
+static inline float Ps2FloatNormalize(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+
+    const uint32_t sign = bits & PS2_FLOAT_SIGN_MASK;
+    const uint32_t exponent = bits & PS2_FLOAT_EXP_MASK;
+
+    if (exponent == 0u)
+    {
+        bits = sign;
+    }
+    else if (exponent == PS2_FLOAT_EXP_MASK)
+    {
+        bits = sign | PS2_FLOAT_MAX_BITS;
+    }
+    else
+    {
+        return value;
+    }
+
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline float Ps2FloatMaxWithSign(bool negative)
+{
+    const uint32_t bits = PS2_FLOAT_MAX_BITS | (negative ? PS2_FLOAT_SIGN_MASK : 0u);
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline float Ps2VuDivide(float fs, float ft)
+{
+    if (ft == 0.0f)
+    {
+        return Ps2FloatMaxWithSign(std::signbit(fs) != std::signbit(ft));
+    }
+    return Ps2FloatNormalize(fs / ft);
+}
+
+static inline float Ps2VuSqrt(float ft)
+{
+    return Ps2FloatNormalize(sqrtf(fabsf(ft)));
+}
+
+static inline float Ps2VuRSqrt(float fs, float ft)
+{
+    const float root = sqrtf(fabsf(ft));
+    if (root == 0.0f)
+    {
+        return Ps2FloatMaxWithSign(std::signbit(fs) != std::signbit(ft));
+    }
+    return Ps2FloatNormalize(fs / root);
+}
+
+static inline void Ps2Vu0MacUpdate(uint32_t &macFlags, uint16_t &status, __m128 res, uint8_t destMask)
+{
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, res);
+    uint32_t mac = 0u, st = 0u;
+    for (int c = 0; c < 4; ++c)
+    {
+        const uint32_t lane = 1u << (3 - c);
+        if ((destMask & lane) == 0u)
+            continue;
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &lanes[c], sizeof(bits));
+        uint32_t f = (bits & 0x80000000u) ? 2u : 0u;
+        if ((bits & 0x7FFFFFFFu) == 0u)
+            f |= 1u;
+        if (f & 1u)
+            mac |= lane;
+        if (f & 2u)
+            mac |= lane << 4;
+        st |= f;
+    }
+    macFlags = mac;
+    status = (uint16_t)((status & 0xFF0u) | st | (st << 6));
+}
+
+static inline __m128i Ps2VuOrderKey(__m128i bits)
+{
+    return _mm_xor_si128(bits, _mm_and_si128(_mm_srai_epi32(bits, 31), _mm_set1_epi32(0x7FFFFFFF)));
+}
+
+static inline __m128 Ps2VuMax(__m128 a, __m128 b)
+{
+    const __m128i ia = _mm_castps_si128(a);
+    const __m128i ib = _mm_castps_si128(b);
+    const __m128i keep = _mm_cmpgt_epi32(Ps2VuOrderKey(ia), Ps2VuOrderKey(ib));
+    return _mm_castsi128_ps(_mm_blendv_epi8(ib, ia, keep));
+}
+
+static inline __m128 Ps2VuMin(__m128 a, __m128 b)
+{
+    const __m128i ia = _mm_castps_si128(a);
+    const __m128i ib = _mm_castps_si128(b);
+    const __m128i keep = _mm_cmpgt_epi32(Ps2VuOrderKey(ib), Ps2VuOrderKey(ia));
+    return _mm_castsi128_ps(_mm_blendv_epi8(ib, ia, keep));
+}
+
+#define PS2_VU0_MAC_UPDATE(ctx, res, mask) Ps2Vu0MacUpdate((ctx)->vu0_mac_flags, (ctx)->vu0_status, (res), (mask))
+
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
+#define PS2_VADD(a, b) Ps2VuNormalize(_mm_add_ps((__m128)(a), (__m128)(b)))
+#define PS2_VSUB(a, b) Ps2VuNormalize(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMUL(a, b) Ps2VuNormalize(_mm_mul_ps((__m128)(a), (__m128)(b)))
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
@@ -609,7 +736,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
 #define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
 #define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+#define FPU_SQRT_S(a) Ps2VuSqrt((float)(a))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -623,7 +750,15 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+inline int32_t ps2CvtWord(float value)
+{
+    if (!(value > -2147483648.0f))
+        return INT32_MIN;
+    if (value >= 2147483648.0f)
+        return INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2CvtWord((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

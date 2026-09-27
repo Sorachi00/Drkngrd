@@ -606,6 +606,14 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setVu0MscalCallback([this](uint32_t startPC, bool resume)
+    {
+        R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+        if (!ctx)
+            ctx = &m_cpuContext;
+        ctx->vu0_itop = m_memory.vif0_regs.itops;
+        executeVU0Microprogram(m_memory.getRDRAM(), ctx, resume ? ctx->vu0_pc : startPC);
+    });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;

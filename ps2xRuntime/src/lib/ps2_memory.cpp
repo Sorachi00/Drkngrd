@@ -327,6 +327,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_completedDmacCauses.clear();
     }
     m_codeRegions.clear();
+    m_vif0Stream.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
@@ -1261,6 +1262,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10003800u && address < 0x10003A00u)
     {
+        if (address == 0x10003810u && (value & 1u))
+        {
+            std::memset(&vif0_regs, 0, sizeof(vif0_regs));
+            m_vif0Stream.clear();
+        }
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -1280,6 +1286,52 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                const bool fromSpr = channelBase == 0x1000D000u;
+                const uint32_t mode = (value >> 2) & 3u;
+                uint32_t ramAddr = madr & 0x7FFFFFF0u;
+                uint32_t sadr = m_ioRegisters[channelBase + 0x80] & 0x3FF0u;
+                uint32_t left = qwc;
+                const uint32_t sqwc = m_ioRegisters[0x1000E030u];
+                const uint32_t burstSize = mode == 2u && ((sqwc >> 16) & 0xFFu)
+                                               ? (sqwc >> 16) & 0xFFu : qwc;
+                while (left && mode != 1u)
+                {
+                    const uint32_t burst = std::min(left, burstSize);
+                    for (uint32_t q = 0; q < burst; ++q)
+                    {
+                        uint32_t offset = 0, limit = 0;
+                        const uint32_t phys = translateAddress(ramAddr);
+                        if (phys > PS2_RAM_SIZE - 16u && !mapVuMemory(phys, 16u, offset, limit))
+                        {
+                            left = 0;
+                            break;
+                        }
+                        if (fromSpr)
+                            write128(ramAddr, read128(0x70000000u + sadr));
+                        else
+                            write128(0x70000000u + sadr, read128(ramAddr));
+                        ramAddr += 16u;
+                        sadr = (sadr + 16u) & 0x3FFFu;
+                        --left;
+                    }
+                    if (mode == 2u)
+                        ramAddr += (sqwc & 0xFFu) * 16u;
+                }
+                m_ioRegisters[channelBase] = value & ~0x100u;
+                m_ioRegisters[channelBase + 0x10] = ramAddr;
+                m_ioRegisters[channelBase + 0x20] = 0;
+                m_ioRegisters[channelBase + 0x80] = sadr;
+                const uint32_t cause = fromSpr ? 8u : 9u;
+                uint32_t &stat = m_ioRegisters[0x1000E010u];
+                stat |= 1u << cause;
+                stat = (stat & 0x7FFFFFFFu) | ((stat & (stat >> 16) & 0x3FFu) ? 0x80000000u : 0u);
+                if (stat & (1u << (cause + 16u)))
+                    queueCompletedDmacCause(cause);
+                return true;
+            }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
@@ -1481,7 +1533,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         const bool compactVifLocalTag =
                             (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                             (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
+                        const bool vif0RefTag = channelBase == 0x10008000u && (chcr & 0x40u) &&
+                                                (id == 0u || id == 3u || id == 4u);
+                        if (compactVifLocalTag || vif0RefTag)
                             appendCompactVif1TagData(currentTagAddr, 0u);
 
                         if (hasPayload)

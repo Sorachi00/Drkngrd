@@ -105,8 +105,13 @@ namespace ps2recomp
             addEntry(address, name);
         }
 
+        std::vector<uint32_t> resumeOwners;
         for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
+            resumeOwners.push_back(ownerStart);
+        std::sort(resumeOwners.rbegin(), resumeOwners.rend());
+        for (uint32_t ownerStart : resumeOwners)
         {
+            const auto &targets = cg.m_resumeEntryTargetsByOwner.at(ownerStart);
             const std::string ownerName = cg.getFunctionName(ownerStart);
             if (ownerName.empty())
             {

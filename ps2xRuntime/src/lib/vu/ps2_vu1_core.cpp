@@ -179,6 +179,8 @@ void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
 
 void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
 {
+    if (dst == m_state.vf[0])
+        return;
     if (dest & 0x8u)
         dst[0] = result[0];
     if (dest & 0x4u)

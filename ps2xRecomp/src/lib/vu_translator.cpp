@@ -16,7 +16,45 @@ namespace ps2recomp
     {
     }
 
+    static bool vuMacroOpUpdatesMacFlags(const Instruction &inst)
+    {
+        const uint8_t format = inst.rs;
+        if (format < COP2_CO)
+            return false;
+        const uint8_t special1_func = static_cast<uint8_t>(inst.function & 0x3F);
+        if (special1_func >= 0x3C)
+        {
+            const uint8_t vu_func = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
+            return vu_func <= 0x0F ||                     // ADDA/SUBA/MADDA/MSUBA bc
+                   (vu_func >= 0x18 && vu_func <= 0x1B) || // MULA bc
+                   vu_func == 0x1C || vu_func == 0x1E ||   // MULAq / MULAi
+                   (vu_func >= 0x20 && vu_func <= 0x2A) || // q/i forms, ADDA/MADDA/MULA
+                   (vu_func >= 0x2C && vu_func <= 0x2E);   // SUBA/MSUBA/OPMULA
+        }
+        return special1_func <= 0x0F ||                    // ADD/SUB/MADD/MSUB bc
+               (special1_func >= 0x18 && special1_func <= 0x1C) || // MUL bc, MULq
+               special1_func == 0x1E ||                     // MULi
+               (special1_func >= 0x20 && special1_func <= 0x2A) || // q/i forms, ADD/MADD/MUL
+               (special1_func >= 0x2C && special1_func <= 0x2E);   // SUB/MSUB/OPMSUB
+    }
+
     std::string VuTranslator::translate(const Instruction &inst)
+    {
+        std::string code = translateImpl(inst);
+        if (vuMacroOpUpdatesMacFlags(inst) && code.find("__m128 res") != std::string::npos)
+        {
+            const auto end = code.rfind('}');
+            if (end != std::string::npos)
+                code.insert(end, fmt::format(" PS2_VU0_MAC_UPDATE(ctx, res, 0x{:X}u);", inst.vectorInfo.vectorField));
+        }
+        if (code.find("ctx->vu0_vf[0] =") != std::string::npos)
+            code += " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
+        if (code.find("ctx->vi[0] =") != std::string::npos)
+            code += " ctx->vi[0] = 0;";
+        return code;
+    }
+
+    std::string VuTranslator::translateImpl(const Instruction &inst)
     {
         uint8_t format = inst.rs; // Use parsed rs field for COP2 format
         uint8_t rt = inst.rt;
@@ -268,15 +306,13 @@ namespace ps2recomp
 
                     return fmt::format(
                         "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+                        "__m128 ftw = _mm_and_ps(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
+                        "__m128 neg_ftw = _mm_xor_ps(ftw, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+                        "uint32_t pos_mask = (uint32_t)_mm_movemask_ps(_mm_cmpgt_ps(fs, ftw)); "
+                        "uint32_t neg_mask = (uint32_t)_mm_movemask_ps(_mm_cmplt_ps(fs, neg_ftw)); "
+                        "uint32_t flags = ((pos_mask & 0x1) << 0) | ((neg_mask & 0x1) << 1) | "
+                        "((pos_mask & 0x2) << 1) | ((neg_mask & 0x2) << 2) | "
+                        "((pos_mask & 0x4) << 2) | ((neg_mask & 0x4) << 3); "
                         "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
                 }

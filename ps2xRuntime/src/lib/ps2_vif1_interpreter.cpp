@@ -59,12 +59,20 @@ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 
 void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u)
+    if (sizeBytes)
+        m_vif0Stream.insert(m_vif0Stream.end(), data, data + sizeBytes);
+    if (m_vif0Stream.empty())
         return;
+    const uint32_t consumed = parseVIF0Stream(m_vif0Stream.data(), static_cast<uint32_t>(m_vif0Stream.size()));
+    m_vif0Stream.erase(m_vif0Stream.begin(), m_vif0Stream.begin() + consumed);
+}
 
+uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
+{
     uint32_t pos = 0;
     while (pos + 4 <= sizeBytes)
     {
+        const uint32_t cmdStart = pos;
         uint32_t cmd = 0u;
         std::memcpy(&cmd, data + pos, sizeof(cmd));
         pos += 4u;
@@ -108,10 +116,16 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         {
             continue;
         }
+        else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF || opcode == VIF_MSCNT)
+        {
+            if (m_vu0MscalCallback)
+                m_vu0MscalCallback((imm & 0x1FFu) * 8u, opcode == VIF_MSCNT);
+            continue;
+        }
         else if (opcode == VIF_STMASK)
         {
             if (pos + 4u > sizeBytes)
-                break;
+                return cmdStart;
             std::memcpy(&vif0_regs.mask, data + pos, sizeof(vif0_regs.mask));
             pos += 4u;
             continue;
@@ -119,7 +133,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STROW)
         {
             if (pos + 16u > sizeBytes)
-                break;
+                return cmdStart;
             std::memcpy(vif0_regs.row, data + pos, 16u);
             pos += 16u;
             continue;
@@ -127,7 +141,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STCOL)
         {
             if (pos + 16u > sizeBytes)
-                break;
+                return cmdStart;
             std::memcpy(vif0_regs.col, data + pos, 16u);
             pos += 16u;
             continue;
@@ -137,6 +151,8 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
             const uint32_t destAddr = static_cast<uint32_t>(imm & 0x1FFu) * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            if (pos + mpgBytes > sizeBytes)
+                return cmdStart;
             uint32_t copyBytes = 0u;
             if (m_vu0Code && destAddr < PS2_VU0_CODE_SIZE && mpgBytes > 0u)
             {
@@ -199,11 +215,15 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t totalBytes = sourceVectorCount * bytesPerVector;
             totalBytes = (totalBytes + 3u) & ~3u;
 
-            if (m_vu0Data && pos + totalBytes <= sizeBytes && vl == 0u)
+            if (pos + totalBytes > sizeBytes)
+                return cmdStart;
+            if (m_vu0Data && vl <= 2u)
             {
                 uint32_t vuAddr = static_cast<uint32_t>(imm & 0x3FFu);
                 if ((imm & 0x8000u) != 0u)
                     vuAddr = (vuAddr + (vif0_regs.tops & 0x3FFu)) & 0x3FFu;
+                const bool zeroExtend = (imm & 0x4000u) != 0u;
+                const bool maskEnable = (opcode & 0x10u) != 0u;
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
@@ -226,11 +246,38 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                     uint32_t lanes[4] = {0u, 0u, 0u, 0u};
                     std::memcpy(lanes, m_vu0Data + destOff, sizeof(lanes));
                     const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+                    uint32_t decoded[4] = {};
                     for (uint32_t c = 0; c < limit; ++c)
                     {
-                        uint32_t scalar = 0u;
-                        std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
-                        lanes[c] = scalar;
+                        if (vl == 0u)
+                            std::memcpy(&decoded[c], srcVec + c * 4u, 4u);
+                        else if (vl == 1u)
+                        {
+                            uint16_t raw;
+                            std::memcpy(&raw, srcVec + c * 2u, 2u);
+                            decoded[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int16_t>(raw));
+                        }
+                        else
+                            decoded[c] = zeroExtend ? srcVec[c] : static_cast<uint32_t>(static_cast<int8_t>(srcVec[c]));
+                    }
+                    const uint32_t cycle = std::min(cyclePos, 3u);
+                    for (uint32_t c = 0; c < 4u; ++c)
+                    {
+                        const uint32_t mask = maskEnable ? (vif0_regs.mask >> ((cycle * 4u + c) * 2u)) & 3u : 0u;
+                        if (mask == 1u)
+                            lanes[c] = vif0_regs.row[c];
+                        else if (mask == 2u)
+                            lanes[c] = vif0_regs.col[cycle];
+                        else if (mask == 0u && (c < limit || limit == 1u))
+                        {
+                            lanes[c] = decoded[limit == 1u ? 0u : c];
+                            if (vif0_regs.mode == 1u || vif0_regs.mode == 2u)
+                            {
+                                lanes[c] += vif0_regs.row[c];
+                                if (vif0_regs.mode == 2u)
+                                    vif0_regs.row[c] = lanes[c];
+                            }
+                        }
                     }
                     _mm_storeu_si128(reinterpret_cast<__m128i *>(m_vu0Data + destOff), _mm_loadu_si128(reinterpret_cast<const __m128i *>(lanes)));
                 }
@@ -245,6 +292,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
             break;
         }
     }
+    return pos;
 }
 
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)

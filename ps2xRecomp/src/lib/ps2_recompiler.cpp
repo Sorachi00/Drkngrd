@@ -1802,11 +1802,6 @@ namespace ps2recomp
                     continue;
                 }
 
-                if (isEntryFunctionName(function.name))
-                {
-                    continue;
-                }
-
                 if (address < function.start || address >= function.end)
                 {
                     continue;
@@ -1838,11 +1833,6 @@ namespace ps2recomp
         for (const auto &function : m_functions)
         {
             if (!function.isRecompiled || function.isStub || function.isSkipped)
-            {
-                continue;
-            }
-
-            if (isEntryFunctionName(function.name))
             {
                 continue;
             }
