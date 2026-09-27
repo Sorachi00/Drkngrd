@@ -456,6 +456,14 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
     {
         uint32_t tx = p[37] >= 2 ? std::max(p[39], p[40]) | p[40] : p[23] - 1,
                  ty = p[38] >= 2 ? std::max(p[41], p[42]) | p[42] : p[24] - 1;
+        // Include one extra texel for bilinear filtering and fixed-UV rounding.
+        if (p[0] == GS_PRIM_SPRITE && s.prim.fst)
+        {
+            if (p[37] == 1)
+                tx = std::min(tx, (std::max(b.vertices[0].u, b.vertices[1].u) >> 4) + 1u);
+            if (p[38] == 1)
+                ty = std::min(ty, (std::max(b.vertices[0].v, b.vertices[1].v) >> 4) + 1u);
+        }
         Range texture = range(p[22], p[20], p[21], tx, ty);
         bool feedback = overlaps(frame, texture) || (zUsed && overlaps(depth, texture));
         if (GSMem::IsPaletted(static_cast<GSMem::PixelStorageMode>(p[22])))

@@ -1297,6 +1297,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    // The guest's 8-byte comb sort underflows its loop count for an empty list.
+    if (kind == GuestBranchKind::DirectCall && targetPc == 0x13764Cu && getRegU32(ctx, 5) == 0u)
+    {
+        ctx->pc = fallthroughPc;
+        return !(m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles));
+    }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 

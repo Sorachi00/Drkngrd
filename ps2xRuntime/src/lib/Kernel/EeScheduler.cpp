@@ -112,6 +112,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    m_nextGifTickCycle = kGifTickCycles;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -275,6 +276,12 @@ void EeScheduler::run()
             continue;
         }
 
+        // Resume one instruction earlier at the registered epilogue entry.
+        if (context.pc == 0x2F9534u)
+        {
+            context.pc = 0x2F9530u;
+        }
+
         if (!m_runtime.hasFunction(context.pc))
         {
             if (!running->invocations.empty())
@@ -374,6 +381,11 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
+    {
+        return true;
+    }
+
+    if (m_eeCycle >= m_nextGifTickCycle)
     {
         return true;
     }
@@ -1752,11 +1764,9 @@ void EeScheduler::processPendingEvents()
 {
     assertExecutor();
     processDueDeadlines();
-    static uint64_t lastGifTick = 0u;
-    constexpr uint64_t kGifTickCycles = 294912u;
-    if (m_eeCycle - lastGifTick >= kGifTickCycles)
+    if (m_eeCycle >= m_nextGifTickCycle)
     {
-        lastGifTick = m_eeCycle;
+        m_nextGifTickCycle = m_eeCycle + kGifTickCycles;
         dispatchIrq(true, 2u);
     }
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
@@ -1862,11 +1872,15 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                const auto now = std::chrono::steady_clock::now();
+                // Discard missed frames without accumulating timer jitter.
+                const auto deliveredAt = now - scheduled.hostDeadline >= kVBlankPeriod
+                                             ? now : scheduled.hostDeadline;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              deliveredAt + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              deliveredAt + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

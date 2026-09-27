@@ -422,6 +422,8 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    static constexpr uint64_t kGifTickCycles = kEeClockHz / 1000u;
+    uint64_t m_nextGifTickCycle = kGifTickCycles;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
