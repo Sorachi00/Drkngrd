@@ -512,6 +512,16 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // Keep compressed input, not a movie's worth of RGBA frames.
+            struct PendingEsChunk
+            {
+                std::vector<uint8_t> bytes;
+                int64_t pts90k, dts90k;
+            };
+            std::deque<PendingEsChunk> pendingVideoEs;
+            size_t pendingVideoEsBytes = 0u;
+            uint64_t backpressureTick = ~0ull;
+            uint32_t backpressureRetries = 0u;
         };
 
         struct MpegStreamCallbackEvent
@@ -1006,19 +1016,15 @@ namespace ps2_stubs
 
         void flushDecoderIfEnded(MpegPlaybackState &playback)
         {
-            if (playback.streamEnded && playback.decoder)
+            if (playback.streamEnded && playback.decoder && playback.pendingVideoEs.empty())
             {
                 playback.decoder->flush(playback.decodedFrames);
             }
         }
 
-        void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
+        void feedElementaryStreamNow(MpegPlaybackState &playback, const uint8_t *data,
+                                     size_t size, int64_t pts90k, int64_t dts90k)
         {
-            if (!data || size == 0)
-            {
-                return;
-            }
-
             const uint32_t feedEsIdx = g_mpeg_stub_state.feedEsTraceCount++;
             if (feedEsIdx < 32u)
             {
@@ -1108,6 +1114,30 @@ namespace ps2_stubs
 
             playback.videoSequenceSyncBuffer.clear();
             flushDecoderIfEnded(playback);
+        }
+
+        void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size,
+                                  int64_t pts90k = -1, int64_t dts90k = -1)
+        {
+            if (!data || !size) return;
+            if (playback.decodedFrames.size() >= kMaxDecodedPicturesAhead || !playback.pendingVideoEs.empty())
+            {
+                playback.pendingVideoEs.push_back({std::vector<uint8_t>(data, data + size), pts90k, dts90k});
+                playback.pendingVideoEsBytes += size;
+                return;
+            }
+            feedElementaryStreamNow(playback, data, size, pts90k, dts90k);
+        }
+
+        void drainPendingVideoEs(MpegPlaybackState &playback)
+        {
+            while (!playback.pendingVideoEs.empty() && playback.decodedFrames.size() < kMaxDecodedPicturesAhead)
+            {
+                auto chunk = std::move(playback.pendingVideoEs.front());
+                playback.pendingVideoEs.pop_front();
+                playback.pendingVideoEsBytes -= chunk.bytes.size();
+                feedElementaryStreamNow(playback, chunk.bytes.data(), chunk.bytes.size(), chunk.pts90k, chunk.dts90k);
+            }
         }
 
         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
@@ -1396,21 +1426,24 @@ namespace ps2_stubs
 
         bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
         {
-            // Let EOF finalization drain any tail that is already in the guest
-            // ring, otherwise bound decode lead to a handful of pictures.
-            //
-            // Important: do not park sceMpegDemuxPss/Ring here. Code Veronica
-            // explicitly wakes its video thread before every demux call and that
-            // thread sleeps again after presenting one picture. A single host
-            // decoder feed can enqueue more than kMaxDecodedPicturesAhead frames;
-            // parking the producer then leaves the consumer asleep after draining
-            // just one frame, with nobody left to issue the next WakeupThread.
-            // Returning 0 bytes consumed instead leaves the guest ring intact and
-            // lets the game's producer loop wake the consumer again. Backpressure
-            // still propagates naturally to sceCdStRead because the ring does not
-            // advance while this is true.
-            return !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
+            // Drakengard primes until demux refuses, then retries in its update
+            // loop. A decoded-frame limit stalls priming after just 8 pictures.
+            return playback.pendingVideoEsBytes >= 2u * 1024u * 1024u;
+        }
+
+        void dampMpegBackpressure(PS2Runtime *runtime, uint32_t mpegAddr)
+        {
+            if (!runtime) return;
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            bool wait;
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                auto &p = getPlaybackState(mpegAddr);
+                if (p.backpressureTick != tick) { p.backpressureTick = tick; p.backpressureRetries = 0u; }
+                wait = ++p.backpressureRetries > 4u;
+            }
+            // Permit the normal priming refusal; yield only repeated retries.
+            if (wait) runtime->eeScheduler().waitVSync(tick, 0, {});
         }
 
         void recordCdStreamBytesDemuxedUnlocked(
@@ -1949,22 +1982,14 @@ namespace ps2_stubs
 
     void sceMpegClearRefBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)ctx;
         (void)runtime;
-        static const uint32_t kRefGlobalAddrs[] = {
-            0x171800u, 0x17180Cu, 0x171818u, 0x171804u, 0x171810u, 0x17181Cu};
-        for (uint32_t addr : kRefGlobalAddrs)
+        const uint32_t mpegAddr = getRegU32(ctx, 4);
+        if (const uint8_t *handle = getMemPtr(rdram, mpegAddr + 0x40u))
         {
-            uint8_t *p = getMemPtr(rdram, addr);
-            if (!p)
-                continue;
-            uint32_t ptr = *reinterpret_cast<uint32_t *>(p);
-            if (ptr != 0u)
-            {
-                uint8_t *q = getMemPtr(rdram, ptr + 0x28u);
-                if (q)
-                    *reinterpret_cast<uint32_t *>(q) = 0u;
-            }
+            uint32_t work = 0u;
+            std::memcpy(&work, handle, sizeof(work));
+            if (work != 0u)
+                if (uint8_t *p = getMemPtr(rdram, work + 4u)) std::memset(p, 0, 8u);
         }
         setReturnU32(ctx, 1u);
     }
@@ -1974,6 +1999,20 @@ namespace ps2_stubs
         if (uint8_t *p = getMemPtr(rdram, addr))
             *reinterpret_cast<uint32_t *>(p) = value;
     }
+    // The PAL libmpeg getters at 0x3029C8/0x3029D4 execute guest code
+    // and read these fields directly, rather than calling an HLE handler.
+    static void syncGuestMpegWorkArea(uint8_t *rdram, uint32_t mpegAddr, const MpegPlaybackState &p)
+    {
+        if (!rdram || !mpegAddr) return;
+        const uint8_t *handle = getMemPtr(rdram, mpegAddr + 0x40u);
+        if (!handle) return;
+        uint32_t work = 0u;
+        std::memcpy(&work, handle, sizeof(work));
+        if (!work) return;
+        mpegGuestWrite32(rdram, work, p.streamEnded && p.decodedFrames.empty() && p.pendingVideoEs.empty() ? 1u : 0u);
+        mpegGuestWrite32(rdram, work + 4u, static_cast<uint32_t>(p.decodedFrames.size() + !p.pendingVideoEs.empty()));
+    }
+
     static void mpegGuestWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
     {
         if (uint8_t *p = getMemPtr(rdram, addr))
@@ -2029,6 +2068,7 @@ namespace ps2_stubs
         mpegGuestWrite64(rdram, param_1 + 0x38, 0);
 
         static const unsigned s_zeroOffsets[] = {
+            0x00, 0x04, 0x08, 0x1C, 0x24,
             0xB4, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC, 0xD0, 0xD4, 0xD8, 0xDC, 0xE0, 0xE4, 0xE8, 0xF8,
             0x0C, 0x14, 0x2C, 0x34, 0x3C,
             0x48, 0xFC, 0x100, 0x104, 0x70, 0x90, 0xAC};
@@ -2038,21 +2078,11 @@ namespace ps2_stubs
         mpegGuestWrite64(rdram, uVar3 + 0x88, 0);
 
         mpegGuestWrite64(rdram, uVar3 + 0xF0, 0xFFFFFFFFFFFFFFFFULL);
-        mpegGuestWrite32(rdram, uVar3 + 0x1C, 0x1209F8u);
-        mpegGuestWrite32(rdram, uVar3 + 0x24, 0x120A08u);
         mpegGuestWrite32(rdram, uVar3 + 0xB0, 1u);
         mpegGuestWrite32(rdram, uVar3 + 0x9C, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, uVar3 + 0x80, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, uVar3 + 0x94, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, uVar3 + 0x98, 0xFFFFFFFFu);
-
-        mpegGuestWrite32(rdram, 0x1717BCu, param_1);
-
-        static const uint32_t s_refValues[] = {
-            0x171A50u, 0x171C58u, 0x171CC0u, 0x171D28u, 0x171D90u,
-            0x171AB8u, 0x171B20u, 0x171B88u, 0x171BF0u};
-        for (unsigned i = 0; i < 9u; ++i)
-            mpegGuestWrite32(rdram, 0x171800u + i * 4u, s_refValues[i]);
 
         uint32_t setDynamicRet = a1_init;
         if (uint8_t *p = getMemPtr(rdram, puVar4 + 8))
@@ -2102,6 +2132,7 @@ namespace ps2_stubs
             }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
+            syncGuestMpegWorkArea(rdram, mpegAddr, playback);
         }
 
         if (backpressured)
@@ -2112,6 +2143,7 @@ namespace ps2_stubs
                     std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec << " decoded=" << decodedCount << std::endl;
                 });
             }
+            dampMpegBackpressure(runtime, mpegAddr);
             setReturnS32(ctx, 0);
             return;
         }
@@ -2193,6 +2225,7 @@ namespace ps2_stubs
             }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+            syncGuestMpegWorkArea(rdram, mpegAddr, playback);
         }
 
         if (backpressured)
@@ -2205,6 +2238,7 @@ namespace ps2_stubs
                               << " avail=" << availableBytes << std::endl;
                 });
             }
+            dampMpegBackpressure(runtime, mpegAddr);
             setReturnS32(ctx, 0);
             return;
         }
@@ -2292,6 +2326,8 @@ namespace ps2_stubs
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            drainPendingVideoEs(playback);
+            flushDecoderIfEnded(playback);
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
@@ -2360,6 +2396,8 @@ namespace ps2_stubs
 
                 frame = std::move(playback.decodedFrames.front());
                 playback.decodedFrames.pop_front();
+                drainPendingVideoEs(playback);
+                flushDecoderIfEnded(playback);
                 playback.width = static_cast<uint32_t>(frame.width);
                 playback.height = static_cast<uint32_t>(frame.height);
                 width = playback.width;
@@ -2387,6 +2425,7 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
             }
+            syncGuestMpegWorkArea(rdram, mpegAddr, playback);
         }
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
@@ -2486,7 +2525,7 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && playback.pendingVideoEs.empty() && presentationComplete) ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2496,7 +2535,7 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-        setReturnS32(ctx, playback.decodedFrames.empty() ? 1 : 0);
+        setReturnS32(ctx, (playback.decodedFrames.empty() && playback.pendingVideoEs.empty()) ? 1 : 0);
     }
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2532,7 +2571,6 @@ namespace ps2_stubs
         mpegGuestWrite32(rdram, param_1 + 0x08, 0u);
         mpegGuestWrite32(rdram, inner + 0x80, 0xFFFFFFFFu);
         mpegGuestWrite32(rdram, inner + 0xAC, 0u);
-        mpegGuestWrite32(rdram, 0x171904u, 0u);
     }
 
     void sceMpegResetDefaultPtsGap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

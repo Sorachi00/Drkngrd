@@ -2443,9 +2443,6 @@ void PS2Runtime::run()
                 GSPerf::framesPerSecond(GSPerf::gameFrames.exchange(0, std::memory_order_relaxed), elapsed),
                 GSPerf::framesPerSecond(perfWindowFrames, elapsed),
                 (vsync - perfVsync) / seconds);
-            std::cout << "[perf] " << perfText << std::endl;
-            // Include reporting time in the next interval rather than silently
-            // excluding it while the guest continues to produce frames.
             perfStart = sampleTime;
             perfWindowFrames = 0;
             perfVsync = vsync;

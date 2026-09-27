@@ -804,6 +804,9 @@ namespace ps2_stubs
             writeGsGParamToScratch(runtime);
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+            // PAL movie exit: restore privileged SMODE2, which GIF cannot set.
+            if (runtime && getRegU32(ctx, 31) == 0x0028656Cu)
+                runtime->memory().gs().smode2 = smode2;
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
             uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
             uint64_t bgcolor = 0ULL;
@@ -1015,7 +1018,19 @@ namespace ps2_stubs
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
         uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        // PAL movies use SetDefDispEnv -> PutDispEnv without separate MMIO
+        // setup. Initialize every field, rather than preserving stack garbage.
+        GsDispEnvMem env{};
+        env.pmode = makePmode(0u, 1u, 1u, 1u, 0u, 0u);
+        env.smode2 = runtime ? runtime->memory().gs().smode2 : 0ull;
+        // PAL movie setup uploads full frames; disable scanline doubling only here.
+        if (getRegU32(ctx, 31) == 0x002860F8u)
+            env.smode2 &= ~1ull;
+        env.dispfb = dispfb;
+        env.display = display;
+        uint8_t *ptr = getMemPtr(rdram, envAddr);
+        if (!ptr) { setReturnS32(ctx, -1); return; }
+        std::memcpy(ptr, &env, sizeof(env));
         setReturnS32(ctx, 0);
     }
 
@@ -1280,10 +1295,8 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ps2_syscalls::WaitVSyncTick(rdram,
-                                    ctx,
-                                    runtime,
-                                    g_gparam.interlace != 0u ? -1 : 1);
+        // The movie player polls field parity even in non-interlaced mode.
+        ps2_syscalls::WaitVSyncTick(rdram, ctx, runtime, -1);
     }
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

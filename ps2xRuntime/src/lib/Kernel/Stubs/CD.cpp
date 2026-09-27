@@ -863,27 +863,11 @@ namespace ps2_stubs
                 const bool hitStreamEnd = g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn;
                 notifyMpegCdStreamDataProduced(static_cast<uint32_t>(readBytes), hitStreamEnd);
 
-                if (g_cdStReadTraceCount < 32u)
-                {
-                    std::cerr << "[sceCdStRead] requested=" << state.requestedSectors
-                              << " accumulated=" << state.sectorsRead
-                              << " chunk=" << sectors
-                              << " buffered=" << readableCdStreamSectors(runtime)
-                              << " lbn=0x" << std::hex << readLbn
-                              << " end=0x" << g_cdStreamingEndLbn
-                              << std::dec << std::endl;
-                    ++g_cdStReadTraceCount;
-                }
-
                 if (state.sectorsRead >= state.requestedSectors || hitStreamEnd)
                 {
                     finishCdStRead(rdram, ctx, state, 0);
                     return;
                 }
-
-                // STMBLK is implemented by repeatedly consuming the stream ring.
-                // If a complete bank is still available, keep draining it before
-                // yielding.  Otherwise the next iteration parks on the producer.
             }
         }
     }
