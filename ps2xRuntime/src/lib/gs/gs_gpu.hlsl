@@ -1,25 +1,33 @@
 // GS compute pipeline. Compile with IEEE strictness: guest interpolation and
 // integer blending must not be replaced with host fixed-function blending.
 cbuffer State : register(b0) { uint4 words[48]; }
+#ifdef PS2X_GS_ROV
+StructuredBuffer<uint4> PrimitiveStates : register(t0);
+static uint primitive = 0;
+#define P(i) PrimitiveStates[primitive*28+(i)/4][(i)%4]
+RasterizerOrderedByteAddressBuffer Vram : register(u0);
+#else
 #define P(i) words[(i)/4][(i)%4]
 RWByteAddressBuffer Vram : register(u0);
+#endif
 RWByteAddressBuffer Output : register(u1);
 ByteAddressBuffer Upload : register(t0);
 
 uint storageBits(uint p) { return p==20 ? 4 : p==19 ? 8 : (p==2||p==10||p==50||p==58) ? 16 : 32; }
 uint bits(uint p) { return (p==1||p==49) ? 24 : p==27 ? 8 : (p==36||p==44) ? 4 : storageBits(p); }
-uint2 extent(uint p) { return p==20 ? uint2(128,128) : p==19 ? uint2(128,64) : storageBits(p)==16 ? uint2(64,64) : uint2(64,32); }
 uint address(uint p, uint base, uint bw, uint x, uint y)
 {
-    uint2 e=extent(p); uint page=(y/e.y)*(bw*64/e.x)+x/e.x;
-    uint block, column; x%=e.x; y%=e.y;
-    if (p==20) { block=BlockTableP4[(y/16)*4+x/32]; column=ColumnTable4[(y%16)*32+x%32]; }
-    else if(p==19) { block=BlockTableP8[(y/16)*8+x/16]; column=ColumnTable8[(y%16)*16+x%16]; }
+    uint sx=(p==20||p==19) ? 7 : 6;
+    uint sy=p==20 ? 7 : (p==19||storageBits(p)==16) ? 6 : 5;
+    uint page=(y>>sy)*((bw*64)>>sx)+(x>>sx);
+    uint block, column; x&=(1u<<sx)-1; y&=(1u<<sy)-1;
+    if (p==20) { block=BlockTableP4((y/16)*4+x/32); column=ColumnTable4((y%16)*32+x%32); }
+    else if(p==19) { block=BlockTableP8((y/16)*8+x/16); column=ColumnTable8((y%16)*16+x%16); }
     else if(storageBits(p)==16) {
         uint i=(y/8)*4+x/16;
-        block=p==10 ? BlockTableC16S[i] : p==50 ? BlockTableZ16[i] : p==58 ? BlockTableZ16S[i] : BlockTableC16[i];
-        column=ColumnTable16[(y%8)*16+x%16];
-    } else { uint i=(y/8)*8+x/8; block=(p==48||p==49) ? BlockTableZ32[i] : BlockTableC32[i]; column=ColumnTable32[(y%8)*8+x%8]; }
+        block=p==10 ? BlockTableC16S(i) : p==50 ? BlockTableZ16(i) : p==58 ? BlockTableZ16S(i) : BlockTableC16(i);
+        column=ColumnTable16((y%8)*16+x%16);
+    } else { uint i=(y/8)*8+x/8; block=(p==48||p==49) ? BlockTableZ32(i) : BlockTableC32(i); column=ColumnTable32((y%8)*8+x%8); }
     return ((base*2048+page*65536+block*2048+column*storageBits(p)) + (p==27||p==36 ? 24 : p==44 ? 28 : 0)) & 0x1ffffff;
 }
 uint readPixel(uint p,uint base,uint bw,uint x,uint y)
@@ -249,13 +257,19 @@ uint displayColor(uint base,uint bw,uint p,uint x,uint y) {
     }
     return c;
 }
+[numthreads(1,1,1)] void SelectSource(uint3 tid:SV_DispatchThreadID) {
+    Output.Store(8+P(7)*4,Output.Load(P(7)*4));
+}
 [numthreads(8,8,1)] void Convert(uint3 tid:SV_DispatchThreadID) {
-    uint x=tid.x,y=tid.y;if(x>=P(3)||y>=P(4)) return;
+    uint x=tid.x,y=tid.y;if(x>=P(3)||y>=P(4)||(P(8)&&Output.Load(8+P(7)*4))) return;
     uint v=displayColor(P(0),P(1),P(2),x+P(5),y+P(6));
     Output.Store(64+(P(7)*640*512+y*640+x)*4,v);
     // Only presence matters. Avoid contending on one global counter for every
     // visible pixel (hundreds of thousands of serialized atomics per frame).
-    if((v&0xffffff)&&Output.Load(P(7)*4)==0) { uint dummy; Output.InterlockedOr(P(7)*4,1,dummy); }
+    if((v&0xffffff)&&Output.Load(P(7)*4)==0) {
+        uint dummy; Output.InterlockedOr(P(7)*4,1,dummy);
+        if(P(8)) Output.InterlockedExchange(16+P(7)*4,P(8),dummy);
+    }
 }
 [numthreads(8,8,1)] void Compose(uint3 tid:SV_DispatchThreadID) {
     uint x=tid.x,y=tid.y; if(x>=P(0)||y>=P(1)) return;
@@ -272,3 +286,23 @@ uint displayColor(uint base,uint bw,uint p,uint x,uint y) {
     }
     c.w=255; Output.Store(64+(4*640*512+tid.y*640+x)*4,pack(c));
 }
+
+#ifdef PS2X_GS_ROV
+struct RovVaryings {float4 position:SV_Position;nointerpolation uint index:TEXCOORD0;};
+
+RovVaryings RovVertex(uint id:SV_VertexID) {
+ primitive=id/3;uint vertex=id%3;
+ float2 xy;
+ if(P(0)==0 || P(0)==6) {
+  float2 corner=vertex==0 ? float2(0,0) : vertex==1 ? float2(2,0) : float2(0,2);
+  xy=float2(P(44),P(45))+corner*float2(P(46),P(47));
+ } else xy=pos(vertex);
+ RovVaryings o;o.position=float4(xy.x/1024-1,1-xy.y/1024,0,1);o.index=primitive;return o;
+}
+void RovPixel(RovVaryings input) {
+ primitive=input.index;uint2 xy=uint2(input.position.xy);
+ if(xy.x<P(44)||xy.y<P(45)||xy.x>=P(44)+P(46)||xy.y>=P(45)+P(47))return;
+ rasterPixel((xy.y-P(45))*P(46)+xy.x-P(44));
+}
+
+#endif

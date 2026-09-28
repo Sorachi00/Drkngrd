@@ -2441,8 +2441,6 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
-        DrawRectangle(6, 6, 628, 24, Fade(BLACK, 0.8f));
-        DrawText(perfText, 10, 10, 16, WHITE);
         EndDrawing();
         ++perfWindowFrames;
 
@@ -2452,11 +2450,6 @@ void PS2Runtime::run()
         if (seconds >= 1.0)
         {
             const auto vsync = m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
-            std::snprintf(perfText, sizeof(perfText),
-                "Game %.1f FPS | Window %.1f FPS | VSync %.1f/s",
-                GSPerf::framesPerSecond(GSPerf::gameFrames.exchange(0, std::memory_order_relaxed), elapsed),
-                GSPerf::framesPerSecond(perfWindowFrames, elapsed),
-                (vsync - perfVsync) / seconds);
             perfStart = sampleTime;
             perfWindowFrames = 0;
             perfVsync = vsync;

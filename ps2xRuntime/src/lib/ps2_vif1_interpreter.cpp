@@ -745,6 +745,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     const bool canAdd = (vl != 3u || vn != 3u);
                     const uint32_t mode = vif1_regs.mode & 3u;
+                    if (handledFormat && !maskEnable && (!canAdd || mode == 0u || mode == 3u))
+                    {
+                        std::memcpy(m_vu1Data + destOff, decompressed, sizeof(decompressed));
+                        continue;
+                    }
                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
 

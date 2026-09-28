@@ -208,6 +208,12 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+    uint8_t m_flagPending = 0;
+    uint8_t m_efuPending = 0;
+    uint8_t m_storePending = 0;
+    uint8_t m_viPending = 0;
+    uint8_t m_accPending = 0;
+    uint16_t m_vfPending = 0;
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -225,6 +231,7 @@ private:
     std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
+    uint64_t m_nextPipelineEvent = UINT64_MAX;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;

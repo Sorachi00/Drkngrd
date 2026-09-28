@@ -394,6 +394,17 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+    file(GLOB VU1_COMPILED_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/generated/*.cpp")
+    target_sources(ps2_runtime PRIVATE src/lib/vu/ps2_vu1_recomp.cpp ${VU1_COMPILED_SOURCES})
+    set_property(SOURCE src/lib/vu/ps2_vu1_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS PS2X_COMPILED_VU1)
+    set_property(SOURCE src/lib/vu/ps2_vu1_recomp.cpp ${VU1_COMPILED_SOURCES}
+        APPEND PROPERTY COMPILE_OPTIONS /fp:precise /arch:AVX2)
+    set_property(SOURCE ${VU1_COMPILED_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/d2OptimizeHugeFunctions>")
+endif()
+
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1

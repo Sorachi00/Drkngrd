@@ -87,8 +87,17 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
     {
+        const bool left = IsKeyDown(KEY_A);
+        const bool right = IsKeyDown(KEY_D);
+        const bool up = IsKeyDown(KEY_W);
+        const bool down = IsKeyDown(KEY_S);
+        if (left || right || up || down)
+        {
+            data[6] = left == right ? kPadStickCenter : (left ? 0x00 : 0xFF);
+            data[7] = up == down ? kPadStickCenter : (up ? 0x00 : 0xFF);
+        }
+
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);
         if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))

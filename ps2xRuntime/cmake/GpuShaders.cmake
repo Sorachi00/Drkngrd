@@ -12,9 +12,18 @@ function(ps2x_add_gpu_backend target)
         file(READ "${runtime}/src/lib/gs/gs_gpu_tables.hlsl" tables)
         file(READ "${runtime}/src/lib/gs/gs_gpu.hlsl" shader)
         file(GENERATE OUTPUT "${shader_dir}/gs_gpu.hlsl" CONTENT "${tables}\n${shader}")
-        foreach(entry Raster Transfer Convert Compose)
+        foreach(entry Raster Transfer Convert Compose SelectSource RovVertex RovPixel)
+            set(profile cs_5_0)
+            set(defines)
+            if(entry STREQUAL "RovVertex")
+                set(profile vs_5_0)
+                set(defines /D PS2X_GS_ROV=1)
+            elseif(entry STREQUAL "RovPixel")
+                set(profile ps_5_0)
+                set(defines /D PS2X_GS_ROV=1)
+            endif()
             add_custom_command(OUTPUT "${shader_dir}/${entry}.h"
-                COMMAND "${PS2X_FXC}" /nologo /T cs_5_0 /E ${entry} /Gis /O3
+                COMMAND "${PS2X_FXC}" /nologo /T ${profile} ${defines} /E ${entry} /Gis /O3
                     /Vn kGs${entry} /Fh "${shader_dir}/${entry}.h" "${shader_dir}/gs_gpu.hlsl"
                 DEPENDS "${runtime}/src/lib/gs/gs_gpu.hlsl" "${runtime}/src/lib/gs/gs_gpu_tables.hlsl"
                 COMMENT "Compiling GS GPU ${entry}" VERBATIM)

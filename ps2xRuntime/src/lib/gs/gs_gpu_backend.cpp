@@ -2,12 +2,15 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #define NOMINMAX
-#include <d3d11.h>
+#include <d3d11_3.h>
 #include <wrl/client.h>
 #include "Raster.h"
+#include "RovVertex.h"
+#include "RovPixel.h"
 #include "Transfer.h"
 #include "Convert.h"
 #include "Compose.h"
+#include "SelectSource.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -88,13 +91,75 @@ bool depthAliases(const Params &p, int x0, int y0, int x1, int y1)
 struct GSGpuBackend::Impl
 {
     mutable std::mutex mutex;
+    std::mutex presentationMutex;
+    ComPtr<ID3D11Buffer> presentationReadback;
+    ComPtr<ID3D11Query> presentationFence;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11Buffer> vram, output, upload, constants, readback;
     ComPtr<ID3D11UnorderedAccessView> vramUav, outputUav;
     ComPtr<ID3D11ShaderResourceView> uploadSrv;
-    ComPtr<ID3D11ComputeShader> raster, transfer, convert, compose;
+    ComPtr<ID3D11ComputeShader> raster, transfer, convert, compose, selectSource;
     ComPtr<ID3D11Query> fence;
+    ComPtr<ID3D11VertexShader> rovVertex;
+    ComPtr<ID3D11PixelShader> rovPixel;
+    ComPtr<ID3D11RasterizerState> rovRaster;
+    ComPtr<ID3D11DepthStencilState> rovDepth;
+    ComPtr<ID3D11Buffer> primitiveBuffer;
+    ComPtr<ID3D11ShaderResourceView> primitiveSrv;
+    std::vector<Params> pending;
+    std::vector<uint32_t> primitiveWords;
+    void flushBatch()
+    {
+        if (pending.empty())
+            return;
+        if (!primitiveBuffer)
+        {
+            D3D11_BUFFER_DESC d{};
+            d.ByteWidth = 512 * 112 * 4;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            d.StructureByteStride = 16;
+            check(device->CreateBuffer(&d, nullptr, &primitiveBuffer), "ROV primitive buffer");
+            check(device->CreateShaderResourceView(primitiveBuffer.Get(), nullptr, &primitiveSrv),
+                  "ROV primitive SRV");
+        }
+        primitiveWords.resize(pending.size() * 112);
+        for (size_t i = 0; i < pending.size(); ++i)
+            std::memcpy(primitiveWords.data() + i * 112, pending[i].data(), 112 * 4);
+        D3D11_BOX box{0, 0, 0, UINT(primitiveWords.size() * 4), 1, 1};
+        ctx->UpdateSubresource(primitiveBuffer.Get(), 0, &box, primitiveWords.data(), 0, 0);
+        ID3D11UnorderedAccessView *nullUavs[2]{};
+        ctx->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        ID3D11UnorderedAccessView *uav = vramUav.Get();
+        ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, &uav, nullptr);
+        ctx->OMSetDepthStencilState(rovDepth.Get(), 0);
+        ctx->RSSetState(rovRaster.Get());
+        D3D11_VIEWPORT viewport{0, 0, 2048, 2048, 0, 1};
+        ctx->RSSetViewports(1, &viewport);
+        ID3D11ShaderResourceView *srv = primitiveSrv.Get();
+        ctx->VSSetShaderResources(0, 1, &srv);
+        ctx->PSSetShaderResources(0, 1, &srv);
+        ctx->VSSetShader(rovVertex.Get(), nullptr, 0);
+        ctx->PSSetShader(rovPixel.Get(), nullptr, 0);
+        ctx->IASetInputLayout(nullptr);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->Draw(UINT(pending.size() * 3), 0);
+        pending.clear();
+        ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, nullUavs,
+                                                       nullptr);
+    }
+    void enqueue(const Params &p)
+    {
+        if (!pending.empty() &&
+            (p[2] != pending[0][2] || p[3] != pending[0][3] || p[4] != pending[0][4] ||
+             !std::equal(p.begin() + 6, p.begin() + 10, pending[0].begin() + 6) ||
+             !std::equal(p.begin() + 16, p.begin() + 20, pending[0].begin() + 16) ||
+             pending.size() == 512))
+            flushBatch();
+        pending.push_back(p);
+    }
     GSTransferCommand command{};
     GSTransferSnapshot snapshot{};
     std::vector<uint8_t> hostBytes;
@@ -106,10 +171,16 @@ struct GSGpuBackend::Impl
     {
         if (device)
             return;
-        D3D_FEATURE_LEVEL wanted = D3D_FEATURE_LEVEL_11_0, actual{};
-        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &wanted, 1, D3D11_SDK_VERSION,
-                                &device, &actual, &ctx),
-              "create hardware device");
+        D3D_FEATURE_LEVEL wanted = D3D_FEATURE_LEVEL_11_0;
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+                                            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 4,
+                                       D3D11_SDK_VERSION, &device, nullptr, &ctx);
+        if (hr == E_INVALIDARG)
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &wanted, 1,
+                                   D3D11_SDK_VERSION, &device, nullptr, &ctx);
+        check(hr, "create hardware device");
+
         D3D11_FEATURE_DATA_DOUBLES doubles{};
         check(device->CheckFeatureSupport(D3D11_FEATURE_DOUBLES, &doubles, sizeof(doubles)),
               "query double precision");
@@ -162,16 +233,45 @@ struct GSGpuBackend::Impl
         check(device->CreateBuffer(&staging, nullptr, &readback), "readback");
         D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
         check(device->CreateQuery(&query, &fence), "fence");
-        check(device->CreateComputeShader(kGsRaster, sizeof(kGsRaster), nullptr, &raster), "raster shader");
+        D3D11_FEATURE_DATA_D3D11_OPTIONS2 options{};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &options,
+                                                  sizeof(options))) &&
+            options.ROVsSupported &&
+            options.ConservativeRasterizationTier >= D3D11_CONSERVATIVE_RASTERIZATION_TIER_1)
+        {
+            check(
+                device->CreateVertexShader(kGsRovVertex, sizeof(kGsRovVertex), nullptr, &rovVertex),
+                "ROV vertex shader");
+            check(device->CreatePixelShader(kGsRovPixel, sizeof(kGsRovPixel), nullptr, &rovPixel),
+                  "ROV pixel shader");
+            D3D11_RASTERIZER_DESC2 rd{};
+            rd.FillMode = D3D11_FILL_SOLID;
+            rd.CullMode = D3D11_CULL_NONE;
+            rd.DepthClipEnable = FALSE;
+            rd.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON;
+            ComPtr<ID3D11Device3> d3;
+            check(device.As(&d3), "D3D11.3 device");
+            ComPtr<ID3D11RasterizerState2> rs2;
+            check(d3->CreateRasterizerState2(&rd, &rs2), "ROV raster state");
+            check(rs2.As(&rovRaster), "ROV raster interface");
+            D3D11_DEPTH_STENCIL_DESC dd{};
+            dd.DepthEnable = FALSE;
+            dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+            check(device->CreateDepthStencilState(&dd, &rovDepth), "ROV depth state");
+        }
+        check(device->CreateComputeShader(kGsRaster, sizeof(kGsRaster), nullptr, &raster),
+              "raster shader");
         check(device->CreateComputeShader(kGsTransfer, sizeof(kGsTransfer), nullptr, &transfer),
               "transfer shader");
         check(device->CreateComputeShader(kGsConvert, sizeof(kGsConvert), nullptr, &convert),
               "conversion shader");
+        check(device->CreateComputeShader(kGsSelectSource, sizeof(kGsSelectSource), nullptr, &selectSource), "source selection shader");
         check(device->CreateComputeShader(kGsCompose, sizeof(kGsCompose), nullptr, &compose),
               "composition shader");
     }
     void dispatch(ID3D11ComputeShader *shader, const Params &p, UINT x, UINT y = 1)
     {
+        flushBatch();
         if (!x || !y)
             return;
         D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -290,6 +390,7 @@ GSGpuBackend::~GSGpuBackend() = default;
 void GSGpuBackend::Initialize(uint8_t *vram, uint32_t size)
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!vram || !size)
     {
         m->initialized = false;
@@ -308,6 +409,7 @@ void GSGpuBackend::Initialize(uint8_t *vram, uint32_t size)
 void GSGpuBackend::Reset()
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     m->command = {};
     m->snapshot = {};
     m->hostBytes.clear();
@@ -316,6 +418,7 @@ void GSGpuBackend::Reset()
 void GSGpuBackend::Flush()
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (m->initialized)
         m->ctx->Flush();
 }
@@ -325,8 +428,13 @@ void GSGpuBackend::TextureFlush()
 void GSGpuBackend::Sync(GSSyncReason reason)
 {
     std::lock_guard lock(m->mutex);
-    if (m->initialized && (reason == GSSyncReason::Finish || reason == GSSyncReason::Reset))
+    m->flushBatch();
+    if (!m->initialized)
+        return;
+    if (reason == GSSyncReason::Reset)
         m->wait();
+    else if (reason == GSSyncReason::Finish)
+        m->ctx->Flush();
 }
 
 void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
@@ -400,6 +508,7 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
         p[o + 10] = v.fog;
     }
     int x0, y0, x1, y1;
+    bool conservativeCoverage = true;
     if (p[0] == 6 || p[0] == 0)
     {
         x0 = int(b.vertices[0].x) - int(p[14]);
@@ -429,6 +538,8 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
             ly = std::min(ly, b.vertices[i].y);
             hy = std::max(hy, b.vertices[i].y);
         }
+        // Keep the software barycentric tolerance inside conservative pixel coverage.
+        conservativeCoverage = hx - lx <= 2048 && hy - ly <= 2048;
         x0 = int(std::floor(lx)) - p[14];
         x1 = int(std::ceil(hx)) - p[14];
         y0 = int(std::floor(ly)) - p[15];
@@ -447,7 +558,11 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
     p[46] = x1 - x0 + 1;
     p[47] = y1 - y0 + 1;
     Range frame = range(p[4], p[2], p[3], x1, y1), depth = range(p[7], p[6], p[3], x1, y1);
+    Range batchFrame = range(p[4], p[2], p[3], p[17], p[19]),
+          batchDepth = range(p[7], p[6], p[3], p[17], p[19]);
     bool zUsed = !p[8] || ((p[9] >> 17) & 3) >= 2;
+    bool batchable = conservativeCoverage && batchFrame.last < VramBytes &&
+                     (!zUsed || (batchDepth.last < VramBytes && !overlaps(batchFrame, batchDepth)));
     bool serial = x1 >= int(p[3] * 64) || frame.last >= VramBytes;
     bool depthFeedback = zUsed && overlaps(frame, depth) && depthAliases(p, x0, y0, x1, y1);
     bool orderedPages = !serial && depthFeedback && p[2] == p[6] && p[4] <= 1 && (p[7] == 48 || p[7] == 49);
@@ -465,10 +580,13 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
                 ty = std::min(ty, (std::max(b.vertices[0].v, b.vertices[1].v) >> 4) + 1u);
         }
         Range texture = range(p[22], p[20], p[21], tx, ty);
+        batchable &= !overlaps(batchFrame, texture) && (!zUsed || !overlaps(batchDepth, texture));
         bool feedback = overlaps(frame, texture) || (zUsed && overlaps(depth, texture));
         if (GSMem::IsPaletted(static_cast<GSMem::PixelStorageMode>(p[22])))
         {
             Range palette = range(p[28], p[27], std::max(1u, p[31]), p[32] + 15, p[33] + 31);
+            batchable &=
+                !overlaps(batchFrame, palette) && (!zUsed || !overlaps(batchDepth, palette));
             feedback |= overlaps(frame, palette) || (zUsed && overlaps(depth, palette));
         }
         serial |= feedback;
@@ -494,6 +612,9 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
             m->dispatch(m->raster.Get(), p, 1);
         }
     }
+    else if (m->rovPixel && x0 >= 0 && y0 >= 0 && x1 < 2048 && y1 < 2048 && batchable &&
+             (p[4] == 0 || p[4] == 1 || p[4] == 2 || p[4] == 10))
+        m->enqueue(p);
     else
         m->dispatch(m->raster.Get(), p, (p[46] * p[47] + 63) / 64);
 }
@@ -501,6 +622,7 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &b)
 void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     m->command = command;
     m->snapshot = {command.trxpos.dsax,
                    command.trxpos.dsay,
@@ -544,6 +666,7 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t size)
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized || !data || !size || m->snapshot.direction != 0 || !m->command.trxreg.rrw)
         return;
     uint32_t n =
@@ -595,6 +718,7 @@ GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
 uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized || !validPsm(psm))
         return 0;
     Params p{};
@@ -614,6 +738,7 @@ uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
 void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t v)
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized || !validPsm(psm))
         return;
     Params p{};
@@ -631,6 +756,7 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
 void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized)
     {
         out.clear();
@@ -642,6 +768,7 @@ void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 bool GSGpuBackend::ClearFramebuffer(const GSContext &c, uint32_t color)
 {
     std::lock_guard lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized || !c.frame.fbw)
         return false;
     if (c.frame.psm != 0 && c.frame.psm != 1 && c.frame.psm != 2 && c.frame.psm != 10)
@@ -649,8 +776,7 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &c, uint32_t color)
     if ((c.fba & 1) && c.frame.psm != 1)
         color |= 0x80000000;
     if (c.frame.psm == 2 || c.frame.psm == 10)
-        color = ((color >> 3) & 31) | ((color >> 6) & 0x3e0) | ((color >> 9) & 0x7c00) |
-                ((color >> 24) >= 0x40 ? 0x8000 : 0);
+        color = ((color >> 3) & 31) | ((color >> 6) & 0x3e0) | ((color >> 9) & 0x7c00) | ((color >> 24) >= 0x40 ? 0x8000 : 0);
     Params p{};
     p[0] = 5;
     p[1] = std::max(c.scissor.x0, c.scissor.x1) - c.scissor.x0 + 1;
@@ -668,7 +794,9 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &c, uint32_t color)
 
 PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &r)
 {
-    std::lock_guard lock(m->mutex);
+    std::lock_guard presentationLock(m->presentationMutex);
+    std::unique_lock lock(m->mutex);
+    m->flushBatch();
     if (!m->initialized)
         return {};
     struct Source
@@ -702,47 +830,36 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &r)
     bool dual = a.valid && b.valid;
     auto convert = [&](Source &s, uint32_t slot, bool allowPreferred) {
         uint32_t base = s.frame.fbp * 32;
-        if (allowPreferred && r.hasPreferredSource && r.preferredDestFbp == s.frame.fbp &&
-            (r.preferredSource.fbw || r.preferredSource.fbp != s.frame.fbp))
+        if (allowPreferred && r.hasPreferredSource && r.preferredDestFbp == s.frame.fbp && (r.preferredSource.fbw || r.preferredSource.fbp != s.frame.fbp))
         {
             s.frame = r.preferredSource;
             base = s.frame.fbp;
             s.x = s.y = 0;
             s.preferred = true;
         }
-        auto run = [&](uint32_t ptr) {
+        auto run = [&](const GSFrameReg &frame, uint32_t ptr, uint32_t choice) {
             Params p{};
             p[0] = ptr;
-            p[1] = s.frame.fbw ? s.frame.fbw : 10;
-            p[2] = s.frame.psm;
+            p[1] = frame.fbw ? frame.fbw : 10;
+            p[2] = frame.psm;
             p[3] = s.w;
             p[4] = s.h;
-            p[5] = s.x;
-            p[6] = s.y;
+            p[5] = choice ? 0 : s.x;
+            p[6] = choice ? 0 : s.y;
             p[7] = slot;
+            p[8] = choice;
+            if (choice) m->dispatch(m->selectSource.Get(), p, 1);
             m->dispatch(m->convert.Get(), p, (s.w + 7) / 8, (s.h + 7) / 8);
         };
-        run(base);
+        run(s.frame, base, 0);
         if (!s.preferred && s.frame.fbp == 0)
-        {
-            uint32_t count = 0;
-            m->read(m->output.Get(), slot * 4, &count, 4);
-            if (!count)
-                for (auto &candidate : r.contextFrames)
-                {
-                    if (candidate.fbp == s.frame.fbp && candidate.fbw == s.frame.fbw &&
-                        candidate.psm == s.frame.psm)
-                        continue;
-                    Source original = s;
-                    s.frame = candidate;
-                    s.x = s.y = 0;
-                    run(candidate.fbp * 32);
-                    m->read(m->output.Get(), slot * 4, &count, 4);
-                    if (count)
-                        break;
-                    s = original;
-                }
-        }
+            for (uint32_t index = 0; index < 2; ++index)
+            {
+                const auto &candidate = r.contextFrames[index];
+                if (candidate.fbp == s.frame.fbp && candidate.fbw == s.frame.fbw && candidate.psm == s.frame.psm)
+                    continue;
+                run(candidate, candidate.fbp * 32, index + 1);
+            }
     };
     uint32_t displayFbp = a.valid ? a.frame.fbp : b.frame.fbp;
     if (a.valid)
@@ -772,6 +889,37 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &r)
     result.sourceFbp = first.frame.fbp;
     result.usedPreferred = first.preferred;
     result.pixels.resize(FramePixels * 4);
-    m->read(m->output.Get(), 64 + 4 * FramePixels * 4, result.pixels.data(), FramePixels * 4);
+    if (!m->presentationReadback)
+    {
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = 64 + FramePixels * 4;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        check(m->device->CreateBuffer(&desc, nullptr, &m->presentationReadback), "presentation readback");
+        D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+        check(m->device->CreateQuery(&query, &m->presentationFence), "presentation fence");
+    }
+    D3D11_BOX header{0, 0, 0, 64, 1, 1};
+    D3D11_BOX pixels{64 + 4 * FramePixels * 4, 0, 0, 64 + 5 * FramePixels * 4, 1, 1};
+    m->ctx->CopySubresourceRegion(m->presentationReadback.Get(), 0, 0, 0, 0, m->output.Get(), 0, &header);
+    m->ctx->CopySubresourceRegion(m->presentationReadback.Get(), 0, 64, 0, 0, m->output.Get(), 0, &pixels);
+    m->ctx->End(m->presentationFence.Get());
+    m->ctx->Flush();
+    HRESULT ready;
+    while ((ready = m->ctx->GetData(m->presentationFence.Get(), nullptr, 0,D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
+    {
+        lock.unlock();
+        Sleep(1);
+        lock.lock();
+    }
+    check(ready, "presentation completion");
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(m->ctx->Map(m->presentationReadback.Get(), 0, D3D11_MAP_READ, 0, &mapped), "presentation map");
+    uint32_t choice;
+    std::memcpy(&choice, static_cast<const uint8_t *>(mapped.pData) + 16 + p[5] * 4, 4);
+    if (choice >= 1 && choice <= 2)
+        result.sourceFbp = r.contextFrames[choice - 1].fbp;
+    std::memcpy(result.pixels.data(), static_cast<const uint8_t *>(mapped.pData) + 64, FramePixels * 4);
+    m->ctx->Unmap(m->presentationReadback.Get(), 0);
     return result;
 }
