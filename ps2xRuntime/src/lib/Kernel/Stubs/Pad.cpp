@@ -261,9 +261,10 @@ namespace ps2_stubs
             data[13] = pressureValue(state, portState, kPadBtnCircle);
             data[14] = pressureValue(state, portState, kPadBtnCross);
             data[15] = pressureValue(state, portState, kPadBtnSquare);
+            // l1_p, r1_p, l2_p, r2_p (ps2sdk ee/rpc/pad/include/libpad.h:114-117).
             data[16] = pressureValue(state, portState, kPadBtnL1);
-            data[17] = pressureValue(state, portState, kPadBtnL2);
-            data[18] = pressureValue(state, portState, kPadBtnR1);
+            data[17] = pressureValue(state, portState, kPadBtnR1);
+            data[18] = pressureValue(state, portState, kPadBtnL2);
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
@@ -518,26 +519,28 @@ namespace ps2_stubs
             return;
         }
 
-        const int32_t currentId = portState->analogMode ? kPadTypeDualShock : kPadTypeDigital;
+        static constexpr int32_t kModeTable[] = {kPadTypeDigital, kPadTypeDualShock};
+        const int32_t currentOffset = portState->analogMode ? 1 : 0;
+        const int32_t currentId = kModeTable[currentOffset];
         switch (infoMode)
         {
         case 1: // PAD_MODECURID
             setReturnS32(ctx, currentId);
             return;
         case 2: // PAD_MODECUREXID
-            setReturnS32(ctx, currentId);
+            setReturnS32(ctx, kModeTable[currentOffset]);
             return;
         case 3: // PAD_MODECUROFFS
-            setReturnS32(ctx, 0);
+            setReturnS32(ctx, currentOffset);
             return;
         case 4: // PAD_MODETABLE
             if (index == -1)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2);
             }
-            else if (index == 0)
+            else if (index >= 0 && index < 2)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kModeTable[index]);
             }
             else
             {
