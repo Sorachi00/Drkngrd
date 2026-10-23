@@ -1,5 +1,6 @@
 #include "ps2recomp/Emitters/function_emitter.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/codegen_helpers.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -200,10 +201,14 @@ namespace ps2recomp
                         continue;
                     }
 
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
+                    const std::string code = cg.translateInstruction(inst, memoryHint);
+                    if (codegen::codeNeedsGuestPc(code))
+                    {
+                        ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    ss << "    " << code;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;

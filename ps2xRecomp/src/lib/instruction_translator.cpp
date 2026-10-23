@@ -99,7 +99,7 @@ namespace ps2recomp
         {
             return fmt::format("runtime->Load{}(rdram, ctx, {})", width, addr);
         }
-        return fmt::format("READ{}({})", width, addr);
+        return fmt::format("READ{}_AT({}, 0x{:X}u, 0x{:X}u)", width, addr, inst.address, m_codeGenerator.m_delaySlotBranchPc);
     }
 
     std::string InstructionTranslator::translateMemoryWrite(const Instruction &inst,
@@ -123,7 +123,7 @@ namespace ps2recomp
         {
             return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, addr, value);
         }
-        return fmt::format("WRITE{}({}, {})", width, addr, value);
+        return fmt::format("WRITE{}_AT({}, {}, 0x{:X}u, 0x{:X}u)", width, addr, value, inst.address, m_codeGenerator.m_delaySlotBranchPc);
     }
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)

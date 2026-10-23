@@ -1,5 +1,6 @@
 #include "ps2recomp/Emitters/control_flow_emitter.h"
 
+#include "ps2recomp/codegen_helpers.h"
 #include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -96,7 +97,24 @@ namespace ps2recomp
         return targets;
     }
 
-    std::string ControlFlowEmitter::delaySlotCode() const
+    std::string ControlFlowEmitter::delaySlotComment() const
+    {
+        if (!hasRealDelaySlot() || !m_delaySlotOverride.empty() || !m_gen.m_emitInstructionComments)
+        {
+            return {};
+        }
+
+        std::string code = "// 0x" + fmt::format("{:x}", m_delaySlot.address) + ": 0x" + fmt::format("{:x}", m_delaySlot.raw);
+        std::string disassembly = R5900Decoder::disassembleInstruction(m_delaySlot);
+        if (!disassembly.empty())
+        {
+            code += "  " + disassembly;
+        }
+        code += " (Delay Slot)\n";
+        return code;
+    }
+
+    std::string ControlFlowEmitter::delaySlotCode(uint32_t slowPathBranchPc) const
     {
         if (!hasRealDelaySlot())
         {
@@ -108,19 +126,9 @@ namespace ps2recomp
             return m_delaySlotOverride;
         }
 
-        std::string code;
-        if (m_gen.m_emitInstructionComments)
-        {
-            code = "// 0x" + fmt::format("{:x}", m_delaySlot.address) + ": 0x" + fmt::format("{:x}", m_delaySlot.raw);
-            std::string disassembly = R5900Decoder::disassembleInstruction(m_delaySlot);
-            if (!disassembly.empty())
-            {
-                code += "  " + disassembly;
-            }
-            code += " (Delay Slot)\n";
-        }
-
-        code += m_gen.translateInstruction(m_delaySlot);
+        m_gen.m_delaySlotBranchPc = slowPathBranchPc;
+        std::string code = m_gen.translateInstruction(m_delaySlot);
+        m_gen.m_delaySlotBranchPc = 0u;
         return code;
     }
 
@@ -131,12 +139,19 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        // RAM accesses get the branch pc for their slow path; a slot that can
+        // reach the runtime otherwise keeps the full delay-slot state.
+        std::string code = delaySlotCode(branchPc());
+        const bool needsGuestPc = codegen::codeNeedsGuestPc(code);
+        if (needsGuestPc)
+        {
+            code = delaySlotCode(0u);
+            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
 
-        const std::string code = delaySlotCode();
-        std::istringstream lines(code);
+        std::istringstream lines(delaySlotComment() + code);
         std::string line;
         while (std::getline(lines, line))
         {
@@ -146,7 +161,10 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (needsGuestPc)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()

@@ -548,6 +548,60 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         }                                                                            \
     } while (0)
 
+static inline void Ps2SlowPathEnter(R5900Context *ctx, uint32_t pc, uint32_t branchPc)
+{
+    ctx->pc = pc;
+    if (branchPc != 0u)
+    {
+        ctx->in_delay_slot = true;
+        ctx->branch_pc = branchPc;
+    }
+}
+
+static inline void Ps2SlowPathLeave(R5900Context *ctx, uint32_t branchPc)
+{
+    if (branchPc != 0u)
+        ctx->in_delay_slot = false;
+}
+
+#define PS2_READ_AT(BITS, TYPE, addr, pc, bpc) ([&]() -> TYPE {       \
+    uint32_t _addr = (uint32_t)(addr);                                \
+    if (!PS2Runtime::isSpecialAddress(_addr))                         \
+        return FAST_READ##BITS(_addr);                                \
+    Ps2SlowPathEnter(ctx, (pc), (bpc));                               \
+    const TYPE _value = runtime->Load##BITS(rdram, ctx, _addr);       \
+    Ps2SlowPathLeave(ctx, (bpc));                                     \
+    return _value; }())
+
+#define PS2_WRITE_AT(BITS, TYPE, addr, val, pc, bpc)                  \
+    do                                                                \
+    {                                                                 \
+        uint32_t _addr = (uint32_t)(addr);                            \
+        const TYPE _value = (TYPE)(val);                              \
+        if (PS2Runtime::isSpecialAddress(_addr))                      \
+        {                                                             \
+            Ps2SlowPathEnter(ctx, (pc), (bpc));                       \
+            runtime->Store##BITS(rdram, ctx, _addr, _value);          \
+            Ps2SlowPathLeave(ctx, (bpc));                             \
+        }                                                             \
+        else                                                          \
+        {                                                             \
+            FAST_WRITE##BITS(_addr, _value);                          \
+        }                                                             \
+    } while (0)
+
+#define READ8_AT(addr, pc, bpc) PS2_READ_AT(8, uint8_t, addr, pc, bpc)
+#define READ16_AT(addr, pc, bpc) PS2_READ_AT(16, uint16_t, addr, pc, bpc)
+#define READ32_AT(addr, pc, bpc) PS2_READ_AT(32, uint32_t, addr, pc, bpc)
+#define READ64_AT(addr, pc, bpc) PS2_READ_AT(64, uint64_t, addr, pc, bpc)
+#define READ128_AT(addr, pc, bpc) PS2_READ_AT(128, __m128i, addr, pc, bpc)
+
+#define WRITE8_AT(addr, val, pc, bpc) PS2_WRITE_AT(8, uint8_t, addr, val, pc, bpc)
+#define WRITE16_AT(addr, val, pc, bpc) PS2_WRITE_AT(16, uint16_t, addr, val, pc, bpc)
+#define WRITE32_AT(addr, val, pc, bpc) PS2_WRITE_AT(32, uint32_t, addr, val, pc, bpc)
+#define WRITE64_AT(addr, val, pc, bpc) PS2_WRITE_AT(64, uint64_t, addr, val, pc, bpc)
+#define WRITE128_AT(addr, val, pc, bpc) PS2_WRITE_AT(128, __m128i, addr, val, pc, bpc)
+
 // Packed Compare Greater Than (PCGT)
 #define PS2_PCGTW(a, b) _mm_cmpgt_epi32((__m128i)(a), (__m128i)(b))
 #define PS2_PCGTH(a, b) _mm_cmpgt_epi16((__m128i)(a), (__m128i)(b))
