@@ -172,6 +172,9 @@ namespace ps2recomp
 
         hint.hasAddress = true;
         hint.address = add32(base, inst.simmediate);
+
+        if (inst.opcode == OPCODE_LQ || inst.opcode == OPCODE_SQ)
+            hint.address &= ~0xFu; //the least significant 4 bits are masked to zero
         return hint;
     }
 
