@@ -2328,6 +2328,8 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // EE FPU: round toward zero, no denormals (ps2_runtime_macros.h, FPU section).
+        _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | _MM_ROUND_TOWARD_ZERO | _MM_FLUSH_ZERO_ON | _MM_DENORMALS_ZERO_ON);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);

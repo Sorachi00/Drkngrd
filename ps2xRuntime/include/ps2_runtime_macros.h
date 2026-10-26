@@ -785,12 +785,83 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
 // FPU (COP1) operations
+#define PS2_FCR31_I 0x00020000u
+#define PS2_FCR31_D 0x00010000u
+#define PS2_FCR31_SI 0x00000040u
+#define PS2_FCR31_SD 0x00000020u
+
+static inline bool Ps2FpuIsZero(float value)
+{
+    return (std::bit_cast<uint32_t>(value) & PS2_FLOAT_EXP_MASK) == 0u;
+}
+
+static inline float Ps2FpuMaxWithSign(uint32_t sign)
+{
+    return std::bit_cast<float>(sign | 0x7FFFFFFFu);
+}
+
+// ADD.S, SUB.S (p.343, p.377): the EE adder keeps one guard bit. The smaller operand loses its bits below that bit before the add (PCSX2 x86/iFPUd.cpp FPU_ADD_SUB).
+static inline uint32_t Ps2FpuDropBitsBelowGuard(uint32_t bits, int shift)
+{
+    if (shift >= 25)
+        return bits & PS2_FLOAT_SIGN_MASK;
+    if (shift >= 2)
+        return bits & (~0u << (shift - 1));
+    return bits;
+}
+
+static inline float Ps2FpuAdd(float fs, float ft)
+{
+    uint32_t a = std::bit_cast<uint32_t>(Ps2FloatNormalize(fs));
+    uint32_t b = std::bit_cast<uint32_t>(Ps2FloatNormalize(ft));
+    const int difference = static_cast<int>((a >> 23) & 0xFFu) - static_cast<int>((b >> 23) & 0xFFu);
+    if (difference > 0)
+        b = Ps2FpuDropBitsBelowGuard(b, difference);
+    else
+        a = Ps2FpuDropBitsBelowGuard(a, -difference);
+    return Ps2FloatNormalize(std::bit_cast<float>(a) + std::bit_cast<float>(b));
+}
+
+// DIV.S (p.357): x/0 sets D, 0/0 sets I; both give +/-0x7FFFFFFF.
+static inline float Ps2FpuDivide(uint32_t &fcr31, float fs, float ft)
+{
+    fcr31 &= ~(PS2_FCR31_I | PS2_FCR31_D);
+    if (Ps2FpuIsZero(ft))
+    {
+        fcr31 |= Ps2FpuIsZero(fs) ? (PS2_FCR31_I | PS2_FCR31_SI) : (PS2_FCR31_D | PS2_FCR31_SD);
+        return Ps2FpuMaxWithSign((std::bit_cast<uint32_t>(fs) ^ std::bit_cast<uint32_t>(ft)) & PS2_FLOAT_SIGN_MASK);
+    }
+    return Ps2FloatNormalize(Ps2FloatNormalize(fs) / Ps2FloatNormalize(ft));
+}
+
+// RSQRT.S (p.375): ft = 0 gives +/-0x7FFFFFFF with the sign of fs.
+static inline float Ps2FpuRSqrt(float fs, float ft)
+{
+    if (Ps2FpuIsZero(ft))
+        return Ps2FpuMaxWithSign(std::bit_cast<uint32_t>(fs) & PS2_FLOAT_SIGN_MASK);
+    return Ps2FloatNormalize(Ps2FloatNormalize(fs) / sqrtf(fabsf(Ps2FloatNormalize(ft))));
+}
+
+// MAX.S, MIN.S (p.363, p.365): compare the raw bits, return one operand unchanged (PCSX2 fp_max).
+static inline bool Ps2FpuGreater(float fs, float ft)
+{
+    const int32_t a = std::bit_cast<int32_t>(fs);
+    const int32_t b = std::bit_cast<int32_t>(ft);
+    return (a < 0 && b < 0) ? (a < b) : (a > b);
+}
+
+static inline float Ps2FpuMax(float fs, float ft) { return Ps2FpuGreater(fs, ft) ? fs : ft; }
+static inline float Ps2FpuMin(float fs, float ft) { return Ps2FpuGreater(ft, fs) ? fs : ft; }
+
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) Ps2VuSqrt((float)(a))
+#define FPU_ADD_S(a, b) Ps2FpuAdd((float)(a), (float)(b))
+#define FPU_SUB_S(a, b) Ps2FpuAdd((float)(a), -(float)(b))
+#define FPU_MUL_S(a, b) Ps2FloatNormalize(Ps2FloatNormalize((float)(a)) * Ps2FloatNormalize((float)(b)))
+#define FPU_DIV_S(fcr31, a, b) Ps2FpuDivide(fcr31, (float)(a), (float)(b))
+#define FPU_SQRT_S(a) sqrtf(fabsf(Ps2FloatNormalize((float)(a))))
+#define FPU_RSQRT_S(a, b) Ps2FpuRSqrt((float)(a), (float)(b))
+#define FPU_MAX_S(a, b) Ps2FpuMax((float)(a), (float)(b))
+#define FPU_MIN_S(a, b) Ps2FpuMin((float)(a), (float)(b))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -802,34 +873,54 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_TRUNC_W_S(a) ((int32_t)(float)(a))
 #define FPU_CEIL_W_S(a) ((int32_t)ceilf((float)(a)))
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
-#define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+// CVT.S.W (p.355) rounds toward zero. Keep only the top 24 bits first: then the result is
+// also right when the compiler converts a constant at build time (it ignores MXCSR).
+static inline float Ps2FpuCvtSW(int32_t value)
+{
+    uint32_t magnitude = value < 0 ? 0u - static_cast<uint32_t>(value) : static_cast<uint32_t>(value);
+    const int width = std::bit_width(magnitude);
+    if (width > 24)
+        magnitude &= ~0u << (width - 24);
+    const float result = static_cast<float>(magnitude);
+    return value < 0 ? -result : result;
+}
+#define FPU_CVT_S_W(a) Ps2FpuCvtSW((int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+// CVT.W.S (p.356): a biased exponent above 0x9D clamps by the sign bit.
 inline int32_t ps2CvtWord(float value)
 {
-    if (!(value > -2147483648.0f))
-        return INT32_MIN;
-    if (value >= 2147483648.0f)
-        return INT32_MAX;
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    if (((bits >> 23) & 0xFFu) > 0x9Du)
+        return (bits & PS2_FLOAT_SIGN_MASK) ? INT32_MIN : INT32_MAX;
     return static_cast<int32_t>(value);
 }
 #define FPU_CVT_W_S(a) ps2CvtWord((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// C.cond.S (p.349): no NaN, so compare sign-magnitude integers; +0 == -0.
+static inline int32_t Ps2FpuCompareKey(float value)
+{
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    if ((bits & PS2_FLOAT_EXP_MASK) == 0u)
+        return 0;
+    const int32_t magnitude = static_cast<int32_t>(bits & ~PS2_FLOAT_SIGN_MASK);
+    return (bits & PS2_FLOAT_SIGN_MASK) ? -magnitude : magnitude;
+}
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) (Ps2FpuCompareKey((float)(a)) == Ps2FpuCompareKey((float)(b)))
+#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_OLT_S(a, b) (Ps2FpuCompareKey((float)(a)) < Ps2FpuCompareKey((float)(b)))
+#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_OLE_S(a, b) (Ps2FpuCompareKey((float)(a)) <= Ps2FpuCompareKey((float)(b)))
+#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
+#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.

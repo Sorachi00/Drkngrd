@@ -147,6 +147,7 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        fcr31 = 0x01000001; // FPU control/status at reset (real PS2)
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value

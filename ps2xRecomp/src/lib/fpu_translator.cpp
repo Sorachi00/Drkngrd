@@ -30,14 +30,14 @@ namespace ps2recomp
         case COP1_MT:
             return fmt::format("{{ uint32_t bits = GPR_U32(ctx, {}); std::memcpy(&ctx->f[{}], &bits, sizeof(bits)); }}", ft, fs);
         case COP1_CF:
-            if (fs == 31)
-                return fmt::format("SET_GPR_U32(ctx, {}, ctx->fcr31);", ft); // FCR31 contains status/control
-            if (fs == 0)
-                return fmt::format("SET_GPR_U32(ctx, {}, 0x00000000);", ft); // FCR0 is the FPU implementation register
-            return fmt::format("SET_GPR_U32(ctx, {}, 0); // Unimplemented FCR{}", ft, fs);
+            // Real PS2 (ps2autotests cpu/ee_fpu/fcr): FCR0-15 read 0x2E30, FCR16-31 read FCR31.
+            if (fs >= 16)
+                return fmt::format("SET_GPR_U32(ctx, {}, ctx->fcr31);", ft);
+            return fmt::format("SET_GPR_U32(ctx, {}, 0x00002E30);", ft);
         case COP1_CT:
+            // Real PS2: only these bits can be written; bits 0 and 24 are always 1.
             if (fs == 31)
-                return fmt::format("ctx->fcr31 = GPR_U32(ctx, {}) & 0x0183FFFF;", ft);
+                return fmt::format("ctx->fcr31 = (GPR_U32(ctx, {}) & 0x0083C078) | 0x01000001;", ft);
             else
                 return fmt::format("// CTC1 to FCR{} ignored", fs);
             return "";
@@ -53,8 +53,7 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("{{ if (ctx->f[{}] == 0.0f) ctx->fcr31 |= 0x100000; "
-                                   "ctx->f[{}] = Ps2VuDivide(ctx->f[{}], ctx->f[{}]); }}", ft, fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_DIV_S(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_SQRT:
                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
@@ -74,7 +73,7 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = Ps2VuRSqrt(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:
@@ -90,9 +89,9 @@ namespace ps2recomp
             case COP1_S_MSUBA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
             case COP1_S_MAX:
-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_MAX_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_MIN:
-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_MIN_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_C_F:
                 return fmt::format("ctx->fcr31 &= ~0x800000;");
             case COP1_S_C_UN:

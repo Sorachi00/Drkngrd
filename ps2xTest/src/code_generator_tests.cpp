@@ -887,8 +887,8 @@ void register_code_generator_tests()
 
             std::string ctc1Code = gen.translateInstruction(ctc1);
             printGeneratedCode("FCR access uses CFC1/CTC1 (CTC1)", ctc1Code);
-            t.IsTrue(ctc1Code.find("ctx->fcr31 = GPR_U32(ctx, 4) & 0x0183FFFF") != std::string::npos,
-                     "CTC1 FCR31 should mask and write fcr31");
+            t.IsTrue(ctc1Code.find("ctx->fcr31 = (GPR_U32(ctx, 4) & 0x0083C078) | 0x01000001") != std::string::npos,
+                     "CTC1 FCR31 should keep only the writable bits");
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
         });
 
