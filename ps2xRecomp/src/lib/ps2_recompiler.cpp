@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <iomanip>
 #include <stdexcept>
 #include <filesystem>
 #include <cctype>
@@ -278,11 +279,6 @@ namespace ps2recomp
             size_t passCount = 0;
         };
 
-        bool isEntryFunctionName(const std::string &name)
-        {
-            return name.rfind("entry_", 0) == 0;
-        }
-
         EntryDiscoveryStats discoverAdditionalEntryPointsImpl(
             std::vector<Function> &functions,
             std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
@@ -404,7 +400,7 @@ namespace ps2recomp
                         continue;
                     }
 
-                    if (isEntryFunctionName(function.name))
+                    if (function.isEntrySlice)
                     {
                         continue;
                     }
@@ -479,6 +475,7 @@ namespace ps2recomp
                     entryFunction.isStub = false;
                     entryFunction.isSkipped = false;
                     entryFunction.isRecompiled = true;
+                    entryFunction.isEntrySlice = true;
 
                     if (pending.containingStart.has_value())
                     {
@@ -594,7 +591,7 @@ namespace ps2recomp
                         continue;
                     }
 
-                    if (isEntryFunctionName(function.name))
+                    if (function.isEntrySlice)
                     {
                         continue;
                     }
@@ -636,7 +633,7 @@ namespace ps2recomp
                     continue;
                 }
 
-                if (!isEntryFunctionName(function.name))
+                if (!function.isEntrySlice)
                 {
                     continue;
                 }
@@ -811,6 +808,8 @@ namespace ps2recomp
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
+            if (!m_config.ghidraMapPath.empty())
+                addGapFillFunctions();
             collectCorrectnessCriticalFunctionStarts();
 
             if (m_functions.empty())
@@ -1784,6 +1783,59 @@ namespace ps2recomp
         }
     }
 
+    void PS2Recompiler::addGapFillFunctions()
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        for (const auto &function : m_functions)
+            ranges.push_back({function.start, function.end});
+        std::sort(ranges.begin(), ranges.end());
+
+        size_t added = 0;
+        for (const auto &section : m_sections)
+        {
+            if (!section.isCode || !section.data)
+                continue;
+            const uint32_t sectionEnd = section.address + section.size;
+            auto addGap = [&](uint32_t start, uint32_t end)
+            {
+                start = (start + 3u) & ~3u;
+                end &= ~3u;
+                bool hasCode = false;
+                for (uint32_t a = start; a < end && !hasCode; a += 4u)
+                {
+                    uint32_t word = 0;
+                    std::memcpy(&word, section.data + (a - section.address), 4);
+                    hasCode = word != 0;
+                }
+                if (!hasCode)
+                    return;
+                Function gap{};
+                std::ostringstream name;
+                name << "gap_" << std::hex << std::setw(8) << std::setfill('0') << start;
+                gap.name = name.str();
+                gap.start = start;
+                gap.end = end;
+                gap.isGapFill = true;
+                m_functions.push_back(gap);
+                ++added;
+            };
+            uint32_t pos = section.address; // first address not covered yet
+            for (const auto &[start, end] : ranges)
+            {
+                if (end <= pos || start >= sectionEnd)
+                    continue;
+                if (start > pos)
+                    addGap(pos, start);
+                pos = std::max(pos, end);
+            }
+            if (pos < sectionEnd)
+                addGap(pos, sectionEnd);
+        }
+        std::sort(m_functions.begin(), m_functions.end(),
+                  [](const Function &a, const Function &b) { return a.start < b.start; });
+        m_reporter.progress("added " + std::to_string(added) + " gap function(s) the function map does not cover");
+    }
+
     void PS2Recompiler::discoverAdditionalEntryPoints()
     {
         m_resumeEntryTargetsByOwner.clear();
@@ -1870,6 +1922,26 @@ namespace ps2recomp
 
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
+            }
+        }
+
+        for (const auto &section : m_sections)
+        {
+            if (section.isCode || section.isBSS || !section.data || section.name == ".eh_frame")
+                continue;
+            for (uint32_t offset = 0; offset + 4u <= section.size; offset += 4u)
+            {
+                uint32_t target = 0;
+                std::memcpy(&target, section.data + offset, 4);
+                if ((target & 3u) != 0u)
+                    continue;
+                const bool inCode = std::any_of(m_sections.begin(), m_sections.end(), [&](const Section &code)
+                                                { return code.isCode && target >= code.address && target < code.address + code.size; });
+                if (!inCode)
+                    continue;
+                const Function *owner = findContainingFunction(target);
+                if (owner && owner->start != target)
+                    m_resumeEntryTargetsByOwner[owner->start].push_back(target);
             }
         }
 

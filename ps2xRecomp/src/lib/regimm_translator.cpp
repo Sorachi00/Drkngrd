@@ -33,10 +33,11 @@ namespace ps2recomp
             const uint32_t target = static_cast<uint32_t>(static_cast<int64_t>(inst.address + 4u) + static_cast<int64_t>(offsetBytes));
             return fmt::format("// REGIMM branch instruction to 0x{:X} - Handled by branch logic", target);
         }
+        // SA holds a byte count, 0..15 (real PS2: ps2autotests cpu/ee_simd/funnel).
         case REGIMM_MTSAB:
-            return fmt::format("ctx->sa = ((GPR_U32(ctx, {}) ^ (uint32_t){}) & 0xF) << 3;", inst.rs, inst.simmediate);
+            return fmt::format("ctx->sa = (GPR_U32(ctx, {}) ^ (uint32_t){}) & 0xF;", inst.rs, inst.simmediate);
         case REGIMM_MTSAH:
-            return fmt::format("ctx->sa = ((GPR_U32(ctx, {}) ^ (uint32_t){}) & 0x7) << 4;", inst.rs, inst.simmediate);
+            return fmt::format("ctx->sa = ((GPR_U32(ctx, {}) ^ (uint32_t){}) & 0x7) << 1;", inst.rs, inst.simmediate);
         case REGIMM_TGEI:
             return fmt::format("if (GPR_S64(ctx, {}) >= (int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TGEIU:

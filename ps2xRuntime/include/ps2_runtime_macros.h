@@ -667,8 +667,9 @@ inline __m128i ps2_psubsw(__m128i a, __m128i b)
 #define PS2_PCEQB(a, b) _mm_cmpeq_epi8((__m128i)(a), (__m128i)(b))
 
 // Packed Absolute (PABS)
-#define PS2_PABSW(a) _mm_abs_epi32((__m128i)(a))
-#define PS2_PABSH(a) _mm_abs_epi16((__m128i)(a))
+// 0x80000000 / 0x8000 saturate to 0x7FFFFFFF / 0x7FFF (p.158, p.159).
+#define PS2_PABSW(a) _mm_min_epu32(_mm_abs_epi32((__m128i)(a)), _mm_set1_epi32(0x7FFFFFFF))
+#define PS2_PABSH(a) _mm_min_epu16(_mm_abs_epi16((__m128i)(a)), _mm_set1_epi16(0x7FFF))
 #define PS2_PABSB(a) _mm_abs_epi8((__m128i)(a))
 
 // Packed Pack (PPAC) - Packs larger elements into smaller ones
@@ -718,71 +719,60 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
 
 // Packed Interleave (PINT)
-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+// PINTH p.214: low half of rt interleaved with the high half of rs.
+#define PS2_PINTH(a, b) _mm_unpacklo_epi16((__m128i)(b), _mm_unpackhi_epi64((__m128i)(a), (__m128i)(a)))
+// PINTEH p.213: each word is rs.h(2i) || rt.h(2i).
+#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0x0000FFFF)), _mm_slli_epi32((__m128i)(a), 16))
 
 // Packed Multiply-Add (PMADD)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
 
 // Packed Variable Shifts
-#define PS2_PSLLVW(a, b) _mm_custom_sllv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRLVW(a, b) _mm_custom_srlv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRAVW(a, b) _mm_custom_srav_epi32((__m128i)(a), (__m128i)(b))
+// rt shifted by rs, words 0 and 2 only, sign-extended to 64 bits (p.262, p.265, p.268).
+#define PS2_PSLLVW(a, b) ps2_psllvw((__m128i)(b), (__m128i)(a))
+#define PS2_PSRLVW(a, b) ps2_psrlvw((__m128i)(b), (__m128i)(a))
+#define PS2_PSRAVW(a, b) ps2_psravw((__m128i)(b), (__m128i)(a))
 
-inline __m128i _mm_custom_sllv_epi32(__m128i a, __m128i count)
+inline __m128i ps2_psllvw(__m128i rt, __m128i rs)
 {
-    alignas(16) int32_t a_arr[4];
-    alignas(16) int32_t count_arr[4];
-    alignas(16) int32_t result[4];
-
-    std::memcpy(a_arr, &a, sizeof(a));
-    std::memcpy(count_arr, &count, sizeof(count));
-
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = a_arr[i] << (count_arr[i] & 0x1F);
-    }
-
-    __m128i out;
-    std::memcpy(&out, result, sizeof(out));
-    return out;
+    const uint32_t w0 = (uint32_t)_mm_cvtsi128_si32(rt) << (_mm_cvtsi128_si32(rs) & 0x1F);
+    const uint32_t w2 = (uint32_t)_mm_extract_epi32(rt, 2) << (_mm_extract_epi32(rs, 2) & 0x1F);
+    return _mm_set_epi64x((int32_t)w2, (int32_t)w0);
 }
 
-inline __m128i _mm_custom_srlv_epi32(__m128i a, __m128i count)
+inline __m128i ps2_psrlvw(__m128i rt, __m128i rs)
 {
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = (uint32_t)a_arr[i] >> (count_arr[i] & 0x1F);
-    }
-    return _mm_loadu_si128((__m128i *)result);
+    const uint32_t w0 = (uint32_t)_mm_cvtsi128_si32(rt) >> (_mm_cvtsi128_si32(rs) & 0x1F);
+    const uint32_t w2 = (uint32_t)_mm_extract_epi32(rt, 2) >> (_mm_extract_epi32(rs, 2) & 0x1F);
+    return _mm_set_epi64x((int32_t)w2, (int32_t)w0);
 }
 
-inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
+inline __m128i ps2_psravw(__m128i rt, __m128i rs)
 {
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = a_arr[i] >> (count_arr[i] & 0x1F);
-    }
-    return _mm_loadu_si128((__m128i *)result);
+    const int32_t w0 = _mm_cvtsi128_si32(rt) >> (_mm_cvtsi128_si32(rs) & 0x1F);
+    const int32_t w2 = _mm_extract_epi32(rt, 2) >> (_mm_extract_epi32(rs, 2) & 0x1F);
+    return _mm_set_epi64x(w2, w0);
 }
 
-// PMFHL function implementations
-inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+// PMFHL reads all 128 bits: hi/lo = bits 63..0, hi1/lo1 = bits 127..64 (pp.227-233).
+#define PS2_HL128(hi, lo) _mm_set_epi64x((int64_t)(hi), (int64_t)(lo)) // [LO.w0, LO.w1, HI.w0, HI.w1]
+
+// PMFHL.SLW: HI.w0 || LO.w0 saturated to a signed word, sign-extended to 64 bits.
+inline int64_t ps2_pmfhl_slw(uint64_t hi, uint64_t lo)
 {
-    return _mm_set1_epi64x(static_cast<long long>(value));
+    const int64_t value = (int64_t)Ps2HiLoToU64(hi, lo);
+    if (value >= INT32_MAX)
+        return INT32_MAX;
+    if (value <= INT32_MIN)
+        return INT32_MIN;
+    return (int32_t)(uint32_t)lo;
 }
 
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+#define PS2_PMFHL_LW(hi, lo, hi1, lo1) _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(PS2_HL128(hi, lo)), _mm_castsi128_ps(PS2_HL128(hi1, lo1)), _MM_SHUFFLE(2, 0, 2, 0)))
+#define PS2_PMFHL_UW(hi, lo, hi1, lo1) _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(PS2_HL128(hi, lo)), _mm_castsi128_ps(PS2_HL128(hi1, lo1)), _MM_SHUFFLE(3, 1, 3, 1)))
+#define PS2_PMFHL_SLW(hi, lo, hi1, lo1) _mm_set_epi64x(ps2_pmfhl_slw((hi1), (lo1)), ps2_pmfhl_slw((hi), (lo)))
+#define PS2_PMFHL_LH(hi, lo, hi1, lo1) ps2_ppach(PS2_HL128(hi1, lo1), PS2_HL128(hi, lo))
+#define PS2_PMFHL_SH(hi, lo, hi1, lo1) _mm_packs_epi32(PS2_HL128(hi, lo), PS2_HL128(hi1, lo1))
 
 // FPU (COP1) operations
 #define PS2_FCR31_I 0x00020000u
@@ -1005,9 +995,10 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 }
 #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
 #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
+// PEXEH p.200 [h2,h1,h0,h3 | h6,h5,h4,h7], PEXEW p.201 [w2,w1,w0,w3], PROT3W p.260 [w1,w2,w0,w3].
+#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
 
 // Additional VU0 operations
 #define PS2_VSQRT(x) sqrtf(x)

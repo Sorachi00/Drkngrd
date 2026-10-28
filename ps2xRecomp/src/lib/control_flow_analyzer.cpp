@@ -61,7 +61,7 @@ namespace ps2recomp
                     continue;
                 }
 
-                if (candidateFn.name.rfind("entry_", 0) == 0)
+                if (candidateFn.isEntrySlice)
                 {
                     continue;
                 }
@@ -422,6 +422,15 @@ namespace ps2recomp
                         result.indirectFallbackEntryPoints.insert(addr);
                     }
                 }
+            }
+        }
+
+        if (function.isGapFill)
+        {
+            for (uint32_t addr : instructionAddresses)
+            {
+                result.entryPoints.insert(addr);
+                result.indirectFallbackEntryPoints.insert(addr);
             }
         }
 

@@ -75,6 +75,7 @@ namespace ps2recomp
 
         bool decodeFunction(Function &function);
         void discoverAdditionalEntryPoints();
+        void addGapFillFunctions();
         bool shouldSkipFunction(const Function &function) const;
         bool isStubFunction(const Function &function) const;
         bool isCorrectnessCriticalFunction(const Function &function) const;

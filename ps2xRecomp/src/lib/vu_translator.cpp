@@ -82,7 +82,8 @@ namespace ps2recomp
             case VU0_CR_CLIP:
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_clip_flags & 0x00FFFFFFu);", rt);
             case VU0_CR_R:
-                return fmt::format("SET_GPR_U32(ctx, {}, static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(ctx->vu0_r))));", rt);
+                // R is 23 bits; bits 31..23 read as 0 (VU p.202).
+                return fmt::format("SET_GPR_U32(ctx, {}, static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(ctx->vu0_r))) & 0x007FFFFFu);", rt);
             case VU0_CR_I:
                 return fmt::format("{{ uint32_t bits; std::memcpy(&bits, &ctx->vu0_i, sizeof(bits)); SET_GPR_U32(ctx, {}, bits); }}", rt);
             case VU0_CR_Q:
@@ -97,6 +98,14 @@ namespace ps2recomp
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_vpu_stat);", rt);
             case VU0_CR_CMSAR1:
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_cmsar1);", rt);
+            // Reserved registers: values from a real PS2 (ps2autotests vu0_macro/transfer).
+            case 19:
+                return fmt::format("SET_GPR_U32(ctx, {}, 0x00002E30u);", rt);
+            case 24:
+                return fmt::format("SET_GPR_U32(ctx, {}, 0x00000C0Cu);", rt);
+            case 23:
+            case 25:
+                return fmt::format("SET_GPR_U32(ctx, {}, 0u);", rt);
             default:
                 return fmt::format("// Unimplemented CFC2 VU control register: {}", rd);
             }
@@ -117,7 +126,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Bits 5..0 are read-only; the flag is 12 bits (VU p.201).
+                return fmt::format("ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0x003Fu) | (GPR_U32(ctx, {}) & 0x0FC0u));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:
@@ -125,17 +135,20 @@ namespace ps2recomp
             case VU0_CR_CLIP:
                 return fmt::format("ctx->vu0_clip_flags = GPR_U32(ctx, {}) & 0x00FFFFFFu;", rt);
             case VU0_CR_R:
-                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(GPR_U32(ctx, {}))));", rt);
+                // R is 23 bits (VU p.34, p.202).
+                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (GPR_U32(ctx, {}) & 0x007FFFFFu))));", rt);
             case VU0_CR_I:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_i, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_Q:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_q, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_CMSAR0:
-                return fmt::format("ctx->vu0_cmsar0 = GPR_U32(ctx, {});", rt);
+                // CMSAR0/CMSAR1 hold 16 bits (real PS2).
+                return fmt::format("ctx->vu0_cmsar0 = GPR_U32(ctx, {}) & 0xFFFFu;", rt);
             case VU0_CR_FBRST:
-                return fmt::format("ctx->vu0_fbrst = GPR_U32(ctx, {}) & 0x00000C0Cu;", rt);
+                // Only DE/TE are kept; a reset bit clears that VU's DE/TE (real PS2).
+                return fmt::format("{{ const uint32_t v = GPR_U32(ctx, {}); ctx->vu0_fbrst = v & 0x00000C0Cu & ~((v & 0x2u) ? 0x000Cu : 0u) & ~((v & 0x200u) ? 0x0C00u : 0u); }}", rt);
             case VU0_CR_CMSAR1:
-                return fmt::format("ctx->vu0_cmsar1 = GPR_U32(ctx, {});", rt);
+                return fmt::format("ctx->vu0_cmsar1 = GPR_U32(ctx, {}) & 0xFFFFu;", rt);
             default:
                 return fmt::format("// Unimplemented CTC2 VU control register: {}", rd);
             }

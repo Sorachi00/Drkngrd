@@ -98,6 +98,8 @@ namespace ps2recomp
         bool isRecompiled = false;
         bool isStub = false;
         bool isSkipped = false;
+        bool isEntrySlice = false; // mid-function entry made by the recompiler (map names can also start with entry_)
+        bool isGapFill = false;    // code between map functions; every instruction is an entry
     };
 
     // Symbol information

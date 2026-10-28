@@ -444,6 +444,15 @@ namespace ps2recomp
             default:
                 return "false";
             }
+        case OPCODE_COP0:
+            if (m_branchInst.rs == COP0_BC)
+            {
+                // CPCOND0: every DMA channel has D_PCR.CPC clear or D_STAT.CIS set (pp.290-293; ps2autotests dma/dmac/cpcond).
+                const std::string cond =
+                    "(((~runtime->Load32(rdram, ctx, 0x1000E020u) | runtime->Load32(rdram, ctx, 0x1000E010u)) & 0x3FFu) == 0x3FFu)";
+                return (m_branchInst.rt & 1u) ? cond : "!" + cond;
+            }
+            break;
         case OPCODE_COP1:
             if (m_branchInst.rs == COP1_BC)
             {
@@ -458,8 +467,8 @@ namespace ps2recomp
             {
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "!(ctx->vu0_vpu_stat & 0x100u)" // COP2 condition = VU1 running, VBS1 (VU p.220, p.230)
+                           : "(ctx->vu0_vpu_stat & 0x100u)";
             }
             break;
         default:
@@ -482,18 +491,13 @@ namespace ps2recomp
         const bool likely = isLikelyBranch();
         const std::string branchTakenVar = fmt::format("branch_taken_0x{:x}", m_branchInst.address);
         std::string unconditionalLinkCode;
-        std::string conditionalLinkCode;
 
-        if (m_branchInst.opcode == OPCODE_REGIMM)
+        // The likely forms also write GPR[31], taken or not (p.34, p.42).
+        if (m_branchInst.opcode == OPCODE_REGIMM &&
+            (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL ||
+             m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL))
         {
-            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL)
-            {
-                unconditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
-            }
-            else if (m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
-            {
-                conditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
-            }
+            unconditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
         }
 
         m_ss << "    {\n";
@@ -507,10 +511,6 @@ namespace ps2recomp
         if (likely)
         {
             m_ss << "        if (" << branchTakenVar << ") {\n";
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "            " << conditionalLinkCode << "\n";
-            }
             emitDelaySlot("            ");
 
             if (isInternalTarget(target))
@@ -526,11 +526,6 @@ namespace ps2recomp
         }
         else
         {
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "        if (" << branchTakenVar << ") { " << conditionalLinkCode << " }\n";
-            }
-
             emitDelaySlot("        ");
 
             m_ss << "        if (" << branchTakenVar << ") {\n";

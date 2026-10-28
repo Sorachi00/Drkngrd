@@ -147,6 +147,7 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f); // VF00 is the constant (0,0,0,1) in every context (VU p.32)
         fcr31 = 0x01000001; // FPU control/status at reset (real PS2)
 
         // Reset COP0 registers
