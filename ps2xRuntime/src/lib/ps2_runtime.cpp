@@ -96,11 +96,6 @@ namespace
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
-    constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
-    constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
-    constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
-    constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
-    constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
 
     struct DispatchHistory
     {
@@ -188,15 +183,6 @@ namespace
         return oss.str();
     }
 
-    uint32_t selectExceptionVector(const R5900Context *ctx, bool tlbRefill)
-    {
-        if (ctx->cop0_status & COP0_STATUS_BEV)
-        {
-            return EXCEPTION_VECTOR_BOOT;
-        }
-        return tlbRefill ? EXCEPTION_VECTOR_TLB_REFILL : EXCEPTION_VECTOR_GENERAL;
-    }
-
     void seedVu0IdleSuccess(R5900Context *ctx)
     {
         if (!ctx)
@@ -279,7 +265,7 @@ namespace
         ctx->vi[0] = 0;
     }
 
-    void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode, bool tlbRefill = false)
+    void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode)
     {
         if (ctx->in_delay_slot)
         {
@@ -294,10 +280,6 @@ namespace
             ctx->cop0_cause = (ctx->cop0_cause & ~(COP0_CAUSE_EXCCODE_MASK | COP0_CAUSE_BD)) |
                               ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK);
         }
-
-        ctx->cop0_status |= COP0_STATUS_EXL;
-        ctx->pc = selectExceptionVector(ctx, tlbRefill);
-        ctx->in_delay_slot = false;
     }
 
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
@@ -1297,6 +1279,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+static uint64_t g_ps2GuestUnwinds = 0;
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1309,7 +1293,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (kind == GuestBranchKind::DirectCall && targetPc == 0x13764Cu && getRegU32(ctx, 5) == 0u)
     {
         ctx->pc = fallthroughPc;
-        return !(m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles));
+        if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+        {
+            ++g_ps2GuestUnwinds;
+            return false;
+        }
+        return true;
     }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -1319,6 +1308,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        ++g_ps2GuestUnwinds;
         return false;
     }
 
@@ -1330,6 +1320,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        ++g_ps2GuestUnwinds;
         return false;
     }
 
@@ -1351,14 +1342,21 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             return true;
         }
 
+        ++g_ps2GuestUnwinds;
         return false;
     }
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t unwindsBefore = g_ps2GuestUnwinds;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
+    {
+        return false;
+    }
+
+    if (g_ps2GuestUnwinds != unwindsBefore)
     {
         return false;
     }
@@ -1379,8 +1377,7 @@ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
         return;
     }
 
-    raiseCop0Exception(ctx, static_cast<uint32_t>(exception),
-                       exception == EXCEPTION_TLB_REFILL);
+    raiseCop0Exception(ctx, static_cast<uint32_t>(exception));
 }
 
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -1981,6 +1978,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -1994,6 +1992,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2007,6 +2006,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2020,6 +2020,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2033,6 +2034,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return _mm_setzero_si128();
     }
@@ -2047,6 +2049,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2060,6 +2063,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2074,6 +2078,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2087,6 +2092,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2102,6 +2108,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2171,7 +2178,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    if (!m_eeScheduler->checkpointDue(cycles))
+    {
+        return false;
+    }
+    ++g_ps2GuestUnwinds;
+    return true;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

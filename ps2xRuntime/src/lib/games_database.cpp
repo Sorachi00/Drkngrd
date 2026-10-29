@@ -128,6 +128,7 @@ static const std::unordered_map<std::string, std::string> gameDatabase =
     { "SCES-50603", "Disney-Pixar Monstruos, S.A. - Isla de los Sustos (Spain)" },
     { "SLPM-65703", "Double Reaction! Plus (Japan)" },
     { "SCPS-56010", "Downhill Racer (Korea)" },
+    { "SLES-52322", "Drakengard (Europe)" },
     { "SLPM-62199", "Dragon Quest Characters - Torneko no Daibouken 3 (Japan)" },
     { "SLPM-62490", "Dragon Quest VIII Premium Disc (Japan)" },
     { "SLPS-20016", "Dream Audition (Japan)" },
