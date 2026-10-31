@@ -8,7 +8,7 @@ namespace ps2_stubs
 {
     namespace
     {
-        constexpr uint32_t kCdStreamBlocking = 1u;
+        constexpr uint32_t kCdStreamNonBlocking = 0u; // STMNBLK
         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
         constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
@@ -31,6 +31,7 @@ namespace ps2_stubs
 
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
+        uint32_t g_cdLastReadEndLbn = 0u; // sceCdGetReadPos; the stream keeps its own position
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
@@ -198,10 +199,6 @@ namespace ps2_stubs
             leaf.c_str(),
             sizeof(file->name) - 1);
 
-        g_cdStreamingLbn = entry.baseLbn;
-        g_cdStreamingEndLbn =
-            entry.baseLbn + entry.sectors;
-
         return 1;
     }
 
@@ -286,74 +283,30 @@ namespace ps2_stubs
 
         if (!ok)
         {
-            // Some game-side wrappers use a nonstandard register layout.
-            // If primary decode does not resolve to a known LBN, try safe alternatives.
-            constexpr uint32_t kMaxReasonableSectors = PS2_RAM_SIZE / kCdSectorSize;
-            if (!isResolvableCdLbn(selected.lbn))
+            // sceCdRead(lbn, sectors, buf, mode) is a0..a3 (ps2sdk libcdvd-common.h); a guessed
+            // argument order would write disc data to any guest address.
+            const uint32_t offset = a2 & PS2_RAM_MASK;
+            const size_t bytes = clampReadBytes(a1, offset);
+            if (bytes > 0)
             {
-                const std::array<CdReadArgs, 5> alternatives = {
-                    CdReadArgs{a2, a1, a0, "a2/a1/a0"},
-                    CdReadArgs{a0, a2, a1, "a0/a2/a1"},
-                    CdReadArgs{a1, a0, a2, "a1/a0/a2"},
-                    CdReadArgs{a1, a2, a0, "a1/a2/a0"},
-                    CdReadArgs{a2, a0, a1, "a2/a0/a1"}};
-
-                for (const CdReadArgs &candidate : alternatives)
-                {
-                    if (candidate.sectors > kMaxReasonableSectors)
-                    {
-                        continue;
-                    }
-                    if (!isResolvableCdLbn(candidate.lbn))
-                    {
-                        continue;
-                    }
-
-                    if (tryRead(candidate))
-                    {
-                        static uint32_t recoverLogCount = 0;
-                        if (recoverLogCount < 16)
-                        {
-                            RUNTIME_LOG("[sceCdRead] recovered with alternate args " << candidate.tag
-                                                                                     << " (pc=0x" << std::hex << ctx->pc
-                                                                                     << " ra=0x" << getRegU32(ctx, 31)
-                                                                                     << " a0=0x" << a0
-                                                                                     << " a1=0x" << a1
-                                                                                     << " a2=0x" << a2 << std::dec << ")" << std::endl);
-                            ++recoverLogCount;
-                        }
-                        selected = candidate;
-                        ok = true;
-                        break;
-                    }
-                }
+                std::memset(rdram + offset, 0, bytes);
             }
 
-            if (!ok)
+            static uint32_t unresolvedLogCount = 0;
+            if (unresolvedLogCount < 32)
             {
-                const uint32_t offset = a2 & PS2_RAM_MASK;
-                const size_t bytes = clampReadBytes(a1, offset);
-                if (bytes > 0)
-                {
-                    std::memset(rdram + offset, 0, bytes);
-                }
-
-                static uint32_t unresolvedLogCount = 0;
-                if (unresolvedLogCount < 32)
-                {
-                    std::cerr << "[sceCdRead] unresolved request pc=0x" << std::hex << ctx->pc
-                              << " ra=0x" << getRegU32(ctx, 31)
-                              << " a0=0x" << a0
-                              << " a1=0x" << a1
-                              << " a2=0x" << a2 << std::dec << std::endl;
-                    ++unresolvedLogCount;
-                }
+                std::cerr << "[sceCdRead] unresolved request pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << " a0=0x" << a0
+                          << " a1=0x" << a1
+                          << " a2=0x" << a2 << std::dec << std::endl;
+                ++unresolvedLogCount;
             }
         }
 
         if (ok)
         {
-            g_cdStreamingLbn = selected.lbn + selected.sectors;
+            g_cdLastReadEndLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -419,7 +372,7 @@ namespace ps2_stubs
 
     void sceCdGetReadPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnU32(ctx, g_cdStreamingLbn);
+        setReturnU32(ctx, g_cdLastReadEndLbn);
     }
 
     void sceCdGetToc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -466,7 +419,7 @@ namespace ps2_stubs
         pos[1] = toBcd(seconds);
         pos[2] = toBcd(sectors);
         pos[3] = 0;
-        setReturnS32(ctx, 1);
+        setReturnU32(ctx, posAddr); // returns p (ps2sdk libcdvd-common.h sceCdIntToPos)
     }
 
     void sceCdMmode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -510,7 +463,8 @@ namespace ps2_stubs
 
         for (int i = 0; i < 64; ++i)
         {
-            uint32_t *entry = reinterpret_cast<uint32_t *>(getMemPtr(rdram, chainAddr + (i * 16)));
+            // sceCdRChain is lbn, sectors, buffer: 12 bytes (ps2sdk libcdvd-common.h)
+            uint32_t *entry = reinterpret_cast<uint32_t *>(getMemPtr(rdram, chainAddr + (i * 12)));
             if (!entry)
             {
                 ok = false;
@@ -520,7 +474,7 @@ namespace ps2_stubs
             const uint32_t lbn = entry[0];
             const uint32_t sectors = entry[1];
             const uint32_t buf = entry[2];
-            if (lbn == 0xFFFFFFFFu || sectors == 0)
+            if (lbn == 0xFFFFFFFFu || sectors == 0xFFFFFFFFu || buf == 0xFFFFFFFFu || sectors == 0)
             {
                 break;
             }
@@ -539,7 +493,7 @@ namespace ps2_stubs
                 break;
             }
 
-            g_cdStreamingLbn = lbn + sectors;
+            g_cdLastReadEndLbn = lbn + sectors;
         }
 
         setReturnS32(ctx, ok ? 1 : 0);
@@ -673,8 +627,6 @@ namespace ps2_stubs
             return;
         }
 
-        g_cdStreamingLbn = resolvedEntry.baseLbn;
-        g_cdStreamingEndLbn = resolvedEntry.baseLbn + resolvedEntry.sectors;
         if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile:ok] path=\"" << sanitizeForLog(path)
@@ -895,7 +847,7 @@ namespace ps2_stubs
             return;
         }
 
-        if (mode == kCdStreamBlocking)
+        if (mode != kCdStreamNonBlocking) // ps2sdk ee/rpc/cdvd/src/ncmd.c sceCdStRead
         {
             continueCdStRead(rdram, ctx, runtime, state);
             return;
@@ -990,6 +942,7 @@ namespace ps2_stubs
         updateCdStreamProduction(runtime);
         g_cdStreamTiming.active = false;
         g_cdStreamTiming.paused = false;
+        resetCdStreamProduction(runtime); // StStat reads 0 after a stop (ps2sdk cdvdstm.c)
         notifyMpegCdStreamEof(runtime);
         setReturnS32(ctx, 1);
     }

@@ -1446,8 +1446,9 @@ namespace ps2_stubs
                 if (p.backpressureTick != tick) { p.backpressureTick = tick; p.backpressureRetries = 0u; }
                 wait = ++p.backpressureRetries > 4u;
             }
-            // Permit the normal priming refusal; yield only repeated retries.
-            if (wait) runtime->eeScheduler().waitVSync(tick, 0, {});
+            // Permit the normal priming refusal; repeated retries cost 1 ms of EE time.
+            // A vsync wait made the player's HBLNK frame timer run in whole fields (2x slow).
+            if (wait) runtime->eeScheduler().accountCycles(static_cast<uint32_t>(EeScheduler::kEeClockHz / 1000u));
         }
 
         void recordCdStreamBytesDemuxedUnlocked(

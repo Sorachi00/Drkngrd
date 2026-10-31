@@ -89,6 +89,9 @@ namespace ps2_stubs
         int32_t g_mcLastResult = 0;
         std::unordered_map<int32_t, McOpenFile> g_mcFiles;
         std::array<McPortState, 2> g_mcPorts{};
+        std::vector<SceMcTblGetDir> g_mcDirList; // GetDir listing that flags != 0 continues
+        size_t g_mcDirPos = 0u;
+        bool g_mcDirValid = false;
         int32_t g_cvMcFileCursor = 0;
 
         constexpr int32_t kCvMcSaveFileBytes = 0x838;
@@ -564,7 +567,7 @@ namespace ps2_stubs
     void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
-        int32_t result = kMcResultNoEntry;
+        int32_t result = kMcResultDeniedPermit; // bad fd -> -5 (ps2sdk mcman main.c McClose)
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             auto it = g_mcFiles.find(fd);
@@ -651,7 +654,7 @@ namespace ps2_stubs
     void sceMcFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
-        int32_t result = kMcResultNoEntry;
+        int32_t result = kMcResultDeniedPermit; // bad fd -> -5 (ps2sdk mcman main.c McClose)
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             auto it = g_mcFiles.find(fd);
@@ -694,149 +697,110 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // mcman_getdir2 (ps2sdk mcman ps2mc_fio.c): split at the last '/' into dir + name pattern;
+    // the root lists no "." / ".."; flags != 0 continues the previous listing.
     void sceMcGetDir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        const uint32_t flags = getRegU32(ctx, 7) & 0xFFFFu;
         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
         const uint32_t tableAddr = getRegU32(ctx, 9);
 
-        std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            if (!isValidMcPortSlot(port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                result = kMcResultNoEntry;
+            }
+            else if (!g_mcPorts[static_cast<size_t>(port)].formatted)
+            {
+                result = kMcResultNoFormat;
+            }
+            else if (flags == 0u)
+            {
+                g_mcDirList.clear();
+                g_mcDirPos = 0u;
+                g_mcDirValid = false;
+                ensureMcRootExists(port);
+
+                std::string path = rawPath;
+                std::replace(path.begin(), path.end(), '\\', '/');
+                const size_t slash = path.rfind('/');
+                const std::string pattern = slash == std::string::npos ? path : path.substr(slash + 1u);
+                const std::string dirPart = slash == std::string::npos ? std::string{}
+                                            : slash == 0u              ? std::string("/")
+                                                                       : path.substr(0u, slash);
+                const std::string guestDir = normalizeGuestMcPathLocked(port, dirPart.empty() ? "." : dirPart);
+                const std::filesystem::path hostDir = guestMcPathToHostPath(port, guestDir);
+
+                std::error_code ec;
+                if (std::filesystem::is_directory(hostDir, ec))
                 {
-                    result = kMcResultNoFormat;
+                    const std::time_t now = std::time(nullptr);
+                    if (guestDir != "/")
+                    {
+                        for (const char *special : {".", ".."})
+                        {
+                            if (!wildcardMatch(pattern, special))
+                                continue;
+                            SceMcTblGetDir entry{};
+                            fillMcDirTableEntry(entry, special, true, 0u, now);
+                            g_mcDirList.push_back(entry);
+                        }
+                    }
+
+                    std::vector<std::filesystem::directory_entry> dirEntries;
+                    for (const auto &entry : std::filesystem::directory_iterator(
+                             hostDir, std::filesystem::directory_options::skip_permission_denied, ec))
+                    {
+                        dirEntries.push_back(entry);
+                    }
+                    std::sort(dirEntries.begin(), dirEntries.end(),
+                              [](const std::filesystem::directory_entry &lhs,
+                                 const std::filesystem::directory_entry &rhs)
+                              {
+                                  return toLowerAscii(lhs.path().filename().string()) <
+                                         toLowerAscii(rhs.path().filename().string());
+                              });
+
+                    for (const auto &entry : dirEntries)
+                    {
+                        const std::string name = entry.path().filename().string();
+                        if (!wildcardMatch(pattern, name))
+                            continue;
+                        std::error_code entryEc;
+                        const bool isDirectory = entry.is_directory(entryEc) && !entryEc;
+                        const uint32_t sizeBytes =
+                            isDirectory ? 0u : static_cast<uint32_t>(entry.file_size(entryEc));
+                        entryEc.clear();
+                        const std::time_t modifiedTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
+                        SceMcTblGetDir tableEntry{};
+                        fillMcDirTableEntry(tableEntry, name, isDirectory, sizeBytes,
+                                            entryEc ? now : modifiedTime);
+                        g_mcDirList.push_back(tableEntry);
+                    }
+                    g_mcDirValid = true;
+                }
+            }
+
+            if (isValidMcPortSlot(port, slot) && g_mcPorts[static_cast<size_t>(port)].formatted && g_mcDirValid)
+            {
+                const size_t left = g_mcDirList.size() - g_mcDirPos;
+                const size_t count = std::min(left, maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
+                uint8_t *dst = (count != 0u && tableAddr != 0u) ? getMemPtr(rdram, tableAddr) : nullptr;
+                if (count != 0u && !dst)
+                {
+                    result = kMcResultDeniedPermit;
                 }
                 else
                 {
-                    ensureMcRootExists(port);
-                    const std::string guestQuery =
-                        normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath);
-                    const bool hasWildcard =
-                        guestQuery.find('*') != std::string::npos || guestQuery.find('?') != std::string::npos;
-
-                    const std::filesystem::path queryRel =
-                        (guestQuery.size() > 1u) ? std::filesystem::path(guestQuery.substr(1)) : std::filesystem::path{};
-
-                    std::filesystem::path parentRel;
-                    std::string pattern;
-                    if (hasWildcard)
-                    {
-                        parentRel = queryRel.parent_path();
-                        pattern = queryRel.filename().string();
-                    }
-                    else
-                    {
-                        const std::filesystem::path queryHostPath = guestMcPathToHostPath(port, guestQuery);
-                        std::error_code queryEc;
-                        if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
-                            std::filesystem::is_directory(queryHostPath, queryEc))
-                        {
-                            parentRel = queryRel;
-                            pattern = "*";
-                        }
-                        else
-                        {
-                            parentRel = queryRel.parent_path();
-                            pattern = queryRel.filename().string();
-                        }
-                    }
-
-                    if (pattern.empty())
-                    {
-                        pattern = "*";
-                    }
-
-                    std::filesystem::path hostDir = getMcRootPath(port);
-                    if (!parentRel.empty())
-                    {
-                        hostDir /= parentRel;
-                    }
-                    hostDir = hostDir.lexically_normal();
-
-                    std::error_code ec;
-                    if (std::filesystem::exists(hostDir, ec) && !ec &&
-                        std::filesystem::is_directory(hostDir, ec))
-                    {
-                        const std::time_t now = std::time(nullptr);
-                        auto appendSpecial = [&](const std::string &name)
-                        {
-                            if (!wildcardMatch(pattern, name))
-                            {
-                                return;
-                            }
-                            SceMcTblGetDir entry{};
-                            fillMcDirTableEntry(entry, name, true, 0u, now);
-                            entries.push_back(entry);
-                        };
-
-                        appendSpecial(".");
-                        appendSpecial("..");
-
-                        std::vector<std::filesystem::directory_entry> dirEntries;
-                        for (const auto &entry : std::filesystem::directory_iterator(
-                                 hostDir, std::filesystem::directory_options::skip_permission_denied, ec))
-                        {
-                            if (ec)
-                            {
-                                break;
-                            }
-                            dirEntries.push_back(entry);
-                        }
-
-                        std::sort(dirEntries.begin(), dirEntries.end(),
-                                  [](const std::filesystem::directory_entry &lhs,
-                                     const std::filesystem::directory_entry &rhs)
-                                  {
-                                      return toLowerAscii(lhs.path().filename().string()) <
-                                             toLowerAscii(rhs.path().filename().string());
-                                  });
-
-                        for (const auto &entry : dirEntries)
-                        {
-                            const std::string name = entry.path().filename().string();
-                            if (!wildcardMatch(pattern, name))
-                            {
-                                continue;
-                            }
-
-                            std::error_code entryEc;
-                            const bool isDirectory = entry.is_directory(entryEc) && !entryEc;
-                            const uint32_t sizeBytes =
-                                isDirectory ? 0u : static_cast<uint32_t>(entry.file_size(entryEc));
-                            entryEc.clear();
-                            const std::time_t modifiedTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
-                            SceMcTblGetDir tableEntry{};
-                            fillMcDirTableEntry(tableEntry,
-                                                name,
-                                                isDirectory,
-                                                sizeBytes,
-                                                entryEc ? now : modifiedTime);
-                            entries.push_back(tableEntry);
-                        }
-
-                        const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
-                        if (entryCount == 0u || tableAddr == 0u)
-                        {
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
-                        {
-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else
-                        {
-                            result = kMcResultDeniedPermit;
-                        }
-                    }
+                    if (count != 0u)
+                        std::memcpy(dst, g_mcDirList.data() + g_mcDirPos, count * sizeof(SceMcTblGetDir));
+                    g_mcDirPos += count;
+                    result = static_cast<int32_t>(count);
                 }
             }
 
@@ -849,9 +813,37 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+
+        // mcman_getentspace (ps2sdk mcman main.c): no dir -> NoEntry, else (length & 1) + deleted
+        // entries; the host has none, length counts "." and "..". Drakengard reads NoEntry as "no save".
+        int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+            if (isValidMcPortSlot(port, slot))
+            {
+                if (!g_mcPorts[static_cast<size_t>(port)].formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    ensureMcRootExists(port);
+                    const std::filesystem::path hostDir = guestMcPathToHostPath(
+                        port, normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath));
+                    std::error_code ec;
+                    if (std::filesystem::is_directory(hostDir, ec))
+                    {
+                        const auto entries = std::distance(std::filesystem::directory_iterator(hostDir, ec),
+                                                           std::filesystem::directory_iterator{});
+                        const size_t length = 2u + static_cast<size_t>(entries);
+                        result = static_cast<int32_t>(length & 1u);
+                    }
+                }
+            }
+            setMcCommandResultLocked(kMcCmdGetEntSpace, result);
         }
         setReturnS32(ctx, 0);
     }
@@ -930,6 +922,7 @@ namespace ps2_stubs
                 state.currentDir = "/";
                 state.formatted = true;
             }
+            g_mcDirValid = false;
         }
         ensureMcRootExists(0);
         ensureMcRootExists(1);
@@ -1050,7 +1043,7 @@ namespace ps2_stubs
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
         uint8_t *dst = (size > 0) ? getMemPtr(rdram, dstAddr) : nullptr;
 
-        int32_t result = kMcResultNoEntry;
+        int32_t result = kMcResultDeniedPermit; // bad fd -> -5 (ps2sdk mcman main.c McClose)
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             auto it = g_mcFiles.find(fd);
@@ -1060,7 +1053,7 @@ namespace ps2_stubs
             }
             else if (it == g_mcFiles.end() || !it->second.file)
             {
-                result = kMcResultNoEntry;
+                result = kMcResultDeniedPermit;
             }
             else if (!dst)
             {
@@ -1125,7 +1118,7 @@ namespace ps2_stubs
         const int32_t offset = static_cast<int32_t>(getRegU32(ctx, 5));
         const int32_t origin = static_cast<int32_t>(getRegU32(ctx, 6));
 
-        int32_t result = kMcResultNoEntry;
+        int32_t result = kMcResultDeniedPermit; // bad fd -> -5 (ps2sdk mcman main.c McClose)
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             auto it = g_mcFiles.find(fd);
@@ -1271,7 +1264,7 @@ namespace ps2_stubs
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
         const uint8_t *src = (size > 0) ? getConstMemPtr(rdram, srcAddr) : nullptr;
 
-        int32_t result = kMcResultNoEntry;
+        int32_t result = kMcResultDeniedPermit; // bad fd -> -5 (ps2sdk mcman main.c McClose)
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             auto it = g_mcFiles.find(fd);
@@ -1281,7 +1274,7 @@ namespace ps2_stubs
             }
             else if (it == g_mcFiles.end() || !it->second.file)
             {
-                result = kMcResultNoEntry;
+                result = kMcResultDeniedPermit;
             }
             else if (!src)
             {

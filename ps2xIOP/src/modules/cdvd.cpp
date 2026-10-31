@@ -1,5 +1,6 @@
 #include "module_factories.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstddef>
@@ -88,7 +89,8 @@ namespace ps2x::iop::detail
 
                 (void)request.function; //(void)fno;
 
-                if(!m_host.readGuest(request.send.address, g_rpc_buffer4,request.send.size))
+                if (request.send.size > sizeof(g_rpc_buffer4) ||
+                    !m_host.readGuest(request.send.address, g_rpc_buffer4, request.send.size))
                     return{};
 
                 cdvdfsv_rpc4_inpacket_t* inbuf = reinterpret_cast<cdvdfsv_rpc4_inpacket_t*>(g_rpc_buffer4);
@@ -96,7 +98,7 @@ namespace ps2x::iop::detail
                 const auto& paths = PS2Runtime::getIoPaths();
 
                 std::string fullSz12cPath = (paths.cdRoot).string() + "\\disc" + inbuf->m_pkt_sz12c.m_path;
-                fullSz12cPath.resize(fullSz12cPath.size() - 2); //remove the ;1 from the ISO 9660 standard
+                // ";1" stays: the CD path lookup strips it (stripIsoVersionSuffix).
 
                 switch (request.send.size)
                 {
@@ -117,7 +119,7 @@ namespace ps2x::iop::detail
                 (void)m_host.writeGuest(
                     request.receive.address,
                     &g_cdvdfsv_srchres,
-                    request.receive.size);
+                    std::min<uint32_t>(request.receive.size, sizeof(g_cdvdfsv_srchres)));
 
 
                 result.handled = true;

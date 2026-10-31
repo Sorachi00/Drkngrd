@@ -25,7 +25,7 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -36,6 +36,9 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[2] = 0xFF;
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+    // Host input is pad 1 only; other pads read as idle.
+    if (port != 0 || slot != 0)
+        return true;
 
     uint16_t btns = 0xFFFFu;
     constexpr int kGamepad = 0;
