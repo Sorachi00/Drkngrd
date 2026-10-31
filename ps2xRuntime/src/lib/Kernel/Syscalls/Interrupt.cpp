@@ -67,7 +67,8 @@ namespace ps2_syscalls
 
     void dispatchDmacHandlersForCause(uint8_t *, PS2Runtime *runtime, uint32_t cause)
     {
-        runtime->eeScheduler().dispatchIrq(true, cause);
+        // 0x100 | n: INTC cause n (VIF interrupt, PS2Memory::vifInterrupt).
+        runtime->eeScheduler().dispatchIrq((cause & 0x100u) == 0u, cause & 0xFFu);
     }
 
     uint64_t GetCurrentVSyncTick(PS2Runtime *runtime)

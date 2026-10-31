@@ -156,19 +156,20 @@ namespace ps2_stubs
         setReturnU32(ctx, oldAddr);
     }
 
+    // sceDmaRecv*(chan, addr, size): the channel sets the direction (fromSPR copies scratchpad to RAM).
     void sceDmaRecv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecv", rdram, ctx, runtime);
+        setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaRecvI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvI", rdram, ctx, runtime);
+        setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, true));
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

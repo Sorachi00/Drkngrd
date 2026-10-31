@@ -405,6 +405,12 @@ public:
     Vu0MscalCallback m_vu0MscalCallback;
     std::vector<uint8_t> m_vif0Stream;
     uint32_t parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes);
+    // VIF1 bytes of a command that waits for more data, or held by an I-bit stall.
+    std::vector<uint8_t> m_vif1Stream;
+    uint32_t parseVIF1Stream(const uint8_t *data, uint32_t sizeBytes);
+    // STAT.VIS: a VIFcode with the I bit stalled the VIF until FBRST.STC.
+    bool m_vifStalled[2] = {false, false};
+    bool vifInterrupt(int unit, uint8_t opcode);
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
@@ -414,6 +420,7 @@ public:
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+    uint32_t m_vif1PendingDirectQwc = 0u; // DIRECT payload qwords still to come
     bool m_vif1PendingPath2DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 

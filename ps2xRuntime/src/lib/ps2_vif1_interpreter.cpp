@@ -30,18 +30,26 @@ namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
 
-    uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
+    // Qwords the last GIFtag's IMAGE packet still needs after these qw qwords (0 if none).
+    uint32_t gifImageRunOver(const uint8_t *data, uint32_t qw)
     {
-        if (!data || sizeBytes < 16u)
-            return 0u;
-
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-        if (flg != kGifFmtImage)
-            return 0u;
-
-        return static_cast<uint32_t>(tagLo & 0x7FFFu);
+        uint32_t at = 0u;
+        while (at < qw)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + at * 16u, sizeof(tagLo));
+            ++at;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            const uint32_t size = flg == 0u ? nloop * nreg : flg == 1u ? (nloop * nreg + 1u) / 2u : nloop;
+            if (at + size > qw)
+                return flg >= kGifFmtImage ? at + size - qw : 0u;
+            at += size;
+        }
+        return 0u;
     }
 }
 
@@ -61,17 +69,38 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes)
         m_vif0Stream.insert(m_vif0Stream.end(), data, data + sizeBytes);
-    if (m_vif0Stream.empty())
+    if (m_vif0Stream.empty() || m_vifStalled[0])
         return;
     const uint32_t consumed = parseVIF0Stream(m_vif0Stream.data(), static_cast<uint32_t>(m_vif0Stream.size()));
     m_vif0Stream.erase(m_vif0Stream.begin(), m_vif0Stream.begin() + consumed);
 }
 
+// I bit: INTC 4/5 after the code; all but MARK then stall until FBRST.STC (real PS2: dma/vif/intstall).
+bool PS2Memory::vifInterrupt(int unit, uint8_t opcode)
+{
+    VIFRegisters &regs = unit ? vif1_regs : vif0_regs;
+    regs.stat |= (1u << 11); // INT
+    queueCompletedDmacCause(0x100u | (unit ? 5u : 4u));
+    if (opcode == VIF_MARK)
+        return false;
+    regs.stat |= (1u << 10); // VIS
+    m_vifStalled[unit] = true;
+    return true;
+}
+
 uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
 {
     uint32_t pos = 0;
+    bool irqArmed = false;
+    uint8_t irqOpcode = 0u;
     while (pos + 4 <= sizeBytes)
     {
+        if (irqArmed)
+        {
+            irqArmed = false;
+            if (vifInterrupt(0, irqOpcode))
+                return pos;
+        }
         const uint32_t cmdStart = pos;
         uint32_t cmd = 0u;
         std::memcpy(&cmd, data + pos, sizeof(cmd));
@@ -83,9 +112,10 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
         const bool irq = (cmd & 0x80000000u) != 0u;
 
         vif0_regs.code = cmd;
-        vif0_regs.num = num;
-        if (irq)
-            vif0_regs.stat |= (1u << 11);
+        vif0_regs.num = 0u;
+        // ERR.MII masks the I bit (PCSX2 Vif_Transfer.cpp vifTransferLoop).
+        irqArmed = irq && !(vif0_regs.err & 1u);
+        irqOpcode = opcode;
 
         if (opcode == VIF_NOP)
         {
@@ -138,6 +168,10 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
             pos += 16u;
             continue;
         }
+        else if (opcode == VIF_OFFSET || opcode == VIF_BASE || opcode == VIF_MSKPATH3)
+        {
+            continue; // VIF1-only codes; no effect on VIF0 (ps2tek "VIF Commands")
+        }
         else if (opcode == VIF_STCOL)
         {
             if (pos + 16u > sizeBytes)
@@ -152,18 +186,18 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
             if (pos + mpgBytes > sizeBytes)
-                return cmdStart;
-            uint32_t copyBytes = 0u;
-            if (m_vu0Code && destAddr < PS2_VU0_CODE_SIZE && mpgBytes > 0u)
             {
-                copyBytes = mpgBytes;
-                if (destAddr + copyBytes > PS2_VU0_CODE_SIZE)
-                    copyBytes = PS2_VU0_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
-                {
-                    std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
-                    markVU0CodeModified();
-                }
+                vif0_regs.num = num;
+                return cmdStart;
+            }
+            // Wrap at the end of the 4 KB code memory (PCSX2 Vif_Codes.cpp:338-351).
+            if (m_vu0Code && mpgBytes > 0u)
+            {
+                const uint32_t first = std::min(mpgBytes, PS2_VU0_CODE_SIZE - destAddr);
+                std::memcpy(m_vu0Code + destAddr, data + pos, first);
+                if (mpgBytes > first)
+                    std::memcpy(m_vu0Code, data + pos + first, std::min(mpgBytes - first, PS2_VU0_CODE_SIZE));
+                markVU0CodeModified();
             }
 
             pos += mpgBytes;
@@ -199,10 +233,8 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
             const uint32_t writeVectorCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             uint32_t cl = vif0_regs.cycle & 0xFFu;
             uint32_t wl = (vif0_regs.cycle >> 8) & 0xFFu;
-            if (cl == 0u)
-                cl = 1u;
             if (wl == 0u)
-                wl = 1u;
+                wl = 256u; // WL=0 means 256; CL=0 is a fill-only cycle (PCSX2 Vif_Unpack.cpp:221)
             uint32_t sourceVectorCount = writeVectorCount;
             if (cl < wl)
             {
@@ -216,12 +248,17 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
             totalBytes = (totalBytes + 3u) & ~3u;
 
             if (pos + totalBytes > sizeBytes)
-                return cmdStart;
-            if (m_vu0Data && vl <= 2u)
             {
-                uint32_t vuAddr = static_cast<uint32_t>(imm & 0x3FFu);
+                // Waits for data; 8-bit VIF0 NUM reads 256 as 0 (real PS2: dma/vif/unpack).
+                vif0_regs.num = num;
+                return cmdStart;
+            }
+            if (m_vu0Data && (vl <= 2u || vn == 3u))
+            {
+                // VU0 data is 256 quadwords (PCSX2 Vif_Unpack.cpp:235 addr & 0xff0).
+                uint32_t vuAddr = static_cast<uint32_t>(imm & 0xFFu);
                 if ((imm & 0x8000u) != 0u)
-                    vuAddr = (vuAddr + (vif0_regs.tops & 0x3FFu)) & 0x3FFu;
+                    vuAddr = (vuAddr + (vif0_regs.tops & 0x3FFu)) & 0xFFu;
                 const bool zeroExtend = (imm & 0x4000u) != 0u;
                 const bool maskEnable = (opcode & 0x10u) != 0u;
                 const uint8_t *srcBase = data + pos;
@@ -230,8 +267,8 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
                 {
                     const uint32_t cyclePos = writeIndex % wl;
                     const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
-                    uint32_t destVec = (cl >= wl) ? ((vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu)
-                                                  : ((vuAddr + writeIndex) & 0x3FFu);
+                    uint32_t destVec = (cl >= wl) ? ((vuAddr + (writeIndex / wl) * cl + cyclePos) & 0xFFu)
+                                                  : ((vuAddr + writeIndex) & 0xFFu);
                     const uint32_t destOff = destVec * 16u;
                     if (destOff + 16u > PS2_VU0_DATA_SIZE)
                     {
@@ -239,15 +276,26 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
                             ++srcIndex;
                         continue;
                     }
-                    if (!sourceAvailable || srcIndex >= sourceVectorCount)
-                        continue;
-                    const uint8_t *srcVec = srcBase + srcIndex * bytesPerVector;
-                    ++srcIndex;
+                    // Fill writes read no data; data lanes take ROW (real PS2: dma/vif/stcycl).
+                    const bool hasSource = sourceAvailable && srcIndex < sourceVectorCount;
+                    const uint8_t *srcVec = hasSource ? srcBase + srcIndex * bytesPerVector : nullptr;
+                    if (hasSource)
+                        ++srcIndex;
                     uint32_t lanes[4] = {0u, 0u, 0u, 0u};
                     std::memcpy(lanes, m_vu0Data + destOff, sizeof(lanes));
                     const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
                     uint32_t decoded[4] = {};
-                    for (uint32_t c = 0; c < limit; ++c)
+                    if (hasSource && vl == 3u)
+                    {
+                        // V4-5: RGBA 5-5-5-1, each field scaled to 8 bits (PCSX2 Vif_Unpack.cpp:103-106).
+                        uint16_t packed;
+                        std::memcpy(&packed, srcVec, sizeof(packed));
+                        decoded[0] = (packed & 0x1Fu) << 3;
+                        decoded[1] = ((packed >> 5) & 0x1Fu) << 3;
+                        decoded[2] = ((packed >> 10) & 0x1Fu) << 3;
+                        decoded[3] = ((packed >> 15) & 1u) << 7;
+                    }
+                    for (uint32_t c = 0; hasSource && vl != 3u && c < limit; ++c)
                     {
                         if (vl == 0u)
                             std::memcpy(&decoded[c], srcVec + c * 4u, 4u);
@@ -260,22 +308,58 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
                         else
                             decoded[c] = zeroExtend ? srcVec[c] : static_cast<uint32_t>(static_cast<int8_t>(srcVec[c]));
                     }
+                    uint32_t writeLimit = limit;
+                    if (hasSource && vl != 3u && (vn == 1u || vn == 2u))
+                    {
+                        // V2 writes X,Y,X,Y; V3 writes W from the next component (real PS2: dma/vif/unpack).
+                        if (vn == 1u)
+                        {
+                            decoded[2] = decoded[0];
+                            decoded[3] = decoded[1];
+                        }
+                        else
+                        {
+                            const uint32_t size = 4u >> vl;
+                            const uint8_t *w = srcVec + 3u * size;
+                            decoded[3] = 0u;
+                            if (w + size <= data + sizeBytes)
+                            {
+                                if (vl == 0u)
+                                    std::memcpy(&decoded[3], w, 4u);
+                                else if (vl == 1u)
+                                {
+                                    uint16_t raw;
+                                    std::memcpy(&raw, w, 2u);
+                                    decoded[3] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int16_t>(raw));
+                                }
+                                else
+                                    decoded[3] = zeroExtend ? *w : static_cast<uint32_t>(static_cast<int8_t>(*w));
+                            }
+                        }
+                        writeLimit = 4u;
+                    }
                     const uint32_t cycle = std::min(cyclePos, 3u);
                     for (uint32_t c = 0; c < 4u; ++c)
                     {
-                        const uint32_t mask = maskEnable ? (vif0_regs.mask >> ((cycle * 4u + c) * 2u)) & 3u : 0u;
+                        uint32_t mask = maskEnable ? (vif0_regs.mask >> ((cycle * 4u + c) * 2u)) & 3u : 0u;
+                        if (!hasSource && mask == 0u)
+                            mask = 1u;
                         if (mask == 1u)
                             lanes[c] = vif0_regs.row[c];
                         else if (mask == 2u)
                             lanes[c] = vif0_regs.col[cycle];
-                        else if (mask == 0u && (c < limit || limit == 1u))
+                        else if (mask == 0u && (c < writeLimit || limit == 1u))
                         {
                             lanes[c] = decoded[limit == 1u ? 0u : c];
-                            if (vif0_regs.mode == 1u || vif0_regs.mode == 2u)
+                            if (vl != 3u && (vif0_regs.mode == 1u || vif0_regs.mode == 2u))
                             {
                                 lanes[c] += vif0_regs.row[c];
                                 if (vif0_regs.mode == 2u)
                                     vif0_regs.row[c] = lanes[c];
+                            }
+                            else if (vl != 3u && vif0_regs.mode == 3u)
+                            {
+                                vif0_regs.row[c] = lanes[c];
                             }
                         }
                     }
@@ -292,6 +376,8 @@ uint32_t PS2Memory::parseVIF0Stream(const uint8_t *data, uint32_t sizeBytes)
             break;
         }
     }
+    if (irqArmed)
+        vifInterrupt(0, irqOpcode);
     return pos;
 }
 
@@ -307,46 +393,87 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+// A command split over two transfers waits for the rest of its data (real PS2: dma/vif/stcycl, basic).
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u)
+    if (m_vif1Stream.empty() && !m_vifStalled[1])
+    {
+        if (sizeBytes == 0u)
+            return;
+        const uint32_t used = parseVIF1Stream(data, sizeBytes);
+        if (used < sizeBytes)
+            m_vif1Stream.assign(data + used, data + sizeBytes);
         return;
+    }
+    if (sizeBytes)
+        m_vif1Stream.insert(m_vif1Stream.end(), data, data + sizeBytes);
+    if (m_vifStalled[1] || m_vif1Stream.empty())
+        return;
+    std::vector<uint8_t> pending;
+    pending.swap(m_vif1Stream);
+    const uint32_t used = parseVIF1Stream(pending.data(), static_cast<uint32_t>(pending.size()));
+    if (used < pending.size())
+        m_vif1Stream.assign(pending.begin() + used, pending.end());
+}
 
+uint32_t PS2Memory::parseVIF1Stream(const uint8_t *data, uint32_t sizeBytes)
+{
     uint32_t pos = 0;
+    bool irqArmed = false;
+    uint8_t irqOpcode = 0u;
+
+    // An IMAGE packet stays open in the GIF over the next DIRECTs; its continued data gets its own tag.
+    auto feedPath2 = [&](const uint8_t *p, uint32_t qw, bool directHl)
+    {
+        uint32_t imageLeft = m_vif1PendingPath2ImageQwc;
+        while (qw != 0u)
+        {
+            if (imageLeft == 0u)
+            {
+                submitGifPacket(GifPathId::Path2, p, qw * 16u, true, directHl);
+                imageLeft = gifImageRunOver(p, qw);
+                break;
+            }
+            const uint32_t chunkQw = std::min<uint32_t>(imageLeft, qw);
+            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+            const uint64_t imageTag =
+                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                ((imageLeft == chunkQw) ? (1ull << 15) : 0ull) |
+                (static_cast<uint64_t>(kGifFmtImage) << 58);
+            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+            std::memcpy(imagePacket.data() + 16u, p, static_cast<size_t>(chunkQw) * 16u);
+            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
+            imageLeft -= chunkQw;
+            p += chunkQw * 16u;
+            qw -= chunkQw;
+        }
+        m_vif1PendingPath2ImageQwc = imageLeft;
+    };
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (irqArmed)
+        {
+            irqArmed = false;
+            if (vifInterrupt(1, irqOpcode))
+                return pos;
+        }
+        // DIRECT/DIRECTHL payload cut off by the end of the last transfer.
+        if (const uint32_t directLeft = m_vif1PendingDirectQwc; directLeft != 0u)
         {
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
             {
                 break;
             }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2,
-                            imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()),
-                            true,
-                            m_vif1PendingPath2DirectHl);
-
+            const uint32_t chunkQw = std::min<uint32_t>(directLeft, availableQw);
+            feedPath2(data + pos, chunkQw, m_vif1PendingPath2DirectHl);
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
+            m_vif1PendingDirectQwc = directLeft - chunkQw;
             continue;
         }
 
+        const uint32_t cmdStart = pos;
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -358,9 +485,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
-        vif1_regs.num = num;
-        if (irq)
-            vif1_regs.stat |= (1u << 11); // INT
+        vif1_regs.num = 0u;
+        // ERR.MII masks the I bit (PCSX2 Vif_Transfer.cpp vifTransferLoop).
+        irqArmed = irq && !(vif1_regs.err & 1u);
+        irqOpcode = opcode;
 
         if (opcode == VIF_NOP)
         {
@@ -460,7 +588,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STMASK)
         {
             if (pos + 4 > sizeBytes)
-                break;
+                return cmdStart;
             uint32_t maskValue = 0;
             std::memcpy(&maskValue, data + pos, sizeof(maskValue));
             vif1_regs.mask = maskValue;
@@ -470,7 +598,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STROW)
         {
             if (pos + 16 > sizeBytes)
-                break;
+                return cmdStart;
             std::memcpy(vif1_regs.row, data + pos, 16);
             pos += 16;
             continue;
@@ -478,28 +606,31 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STCOL)
         {
             if (pos + 16 > sizeBytes)
-                break;
+                return cmdStart;
             std::memcpy(vif1_regs.col, data + pos, 16);
             pos += 16;
             continue;
         }
         else if (opcode == VIF_MPG)
         {
-            uint32_t destAddr = (uint32_t)imm * 8u;
+            uint32_t destAddr = ((uint32_t)imm * 8u) & (PS2_VU1_CODE_SIZE - 1u); // PCSX2 Vif_Codes.cpp:375
             // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
             // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
-            if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+            if (pos + mpgBytes > sizeBytes)
             {
-                uint32_t copyBytes = mpgBytes;
-                if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
-                    copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
-                {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
-                }
+                vif1_regs.num = instructionCount;
+                return cmdStart;
+            }
+            if (m_vu1Code && mpgBytes > 0 && pos + mpgBytes <= sizeBytes)
+            {
+                // Wrap at the end of the 16 KB code memory (PCSX2 Vif_Codes.cpp:338-351).
+                const uint32_t first = std::min(mpgBytes, PS2_VU1_CODE_SIZE - destAddr);
+                std::memcpy(m_vu1Code + destAddr, data + pos, first);
+                if (mpgBytes > first)
+                    std::memcpy(m_vu1Code, data + pos + first, std::min(mpgBytes - first, PS2_VU1_CODE_SIZE));
+                markVU1CodeModified();
             }
             pos += mpgBytes;
             if (pos > sizeBytes)
@@ -508,34 +639,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
-            uint32_t qwCount = imm;
-            if (qwCount == 0)
-                qwCount = 65536;
+            const uint32_t qwCount = imm != 0u ? imm : 65536u;
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
-                qwCount = availableQw;
-
-            if (qwCount > 0)
+            if (availableQw == 0u)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
-                {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
-                    {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
-                    }
-                }
+                return cmdStart; // waits for its data
             }
-
-            pos += qwCount * 16;
-            if (truncated)
+            const bool directHl = (opcode == VIF_DIRECTHL);
+            const uint32_t chunkQw = std::min(qwCount, availableQw);
+            feedPath2(data + pos, chunkQw, directHl);
+            pos += chunkQw * 16u;
+            if (chunkQw < qwCount)
             {
+                // The rest of the payload comes with the next transfer.
+                m_vif1PendingDirectQwc = qwCount - chunkQw;
+                m_vif1PendingPath2DirectHl = directHl;
                 pos = sizeBytes;
                 break;
             }
@@ -573,10 +691,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // STCYCL controls write cycles for UNPACK.
             uint32_t cl = vif1_regs.cycle & 0xFFu;
             uint32_t wl = (vif1_regs.cycle >> 8) & 0xFFu;
-            if (cl == 0u)
-                cl = 1u;
             if (wl == 0u)
-                wl = 1u;
+                wl = 256u; // WL=0 means 256; CL=0 is a fill-only cycle (PCSX2 Vif_Unpack.cpp:221)
 
             uint32_t sourceVectorCount = writeVectorCount;
             if (cl < wl)
@@ -597,7 +713,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (pos + totalBytes > sizeBytes)
+            {
+                // Waits for data; NUM = vectors left (real PS2: dma/vif/unpack).
+                vif1_regs.num = writeVectorCount;
+                return cmdStart;
+            }
+
+            // CL = 0 reads no data but still writes every vector (real PS2: dma/vif/stcycl).
+            if (m_vu1Data)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
@@ -725,14 +849,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         // V4-5: packed color-like format in a single 16-bit value.
                         uint16_t packed = 0;
                         std::memcpy(&packed, srcVec, sizeof(packed));
-                        decompressed[0] = packed & 0x1Fu;
-                        decompressed[1] = (packed >> 5) & 0x1Fu;
-                        decompressed[2] = (packed >> 10) & 0x1Fu;
-                        decompressed[3] = (packed >> 15) & 0x01u;
+                        // Each field scaled to 8 bits (PCSX2 Vif_Unpack.cpp:103-106).
+                        decompressed[0] = (packed & 0x1Fu) << 3;
+                        decompressed[1] = ((packed >> 5) & 0x1Fu) << 3;
+                        decompressed[2] = ((packed >> 10) & 0x1Fu) << 3;
+                        decompressed[3] = ((packed >> 15) & 0x01u) << 7;
                     }
                     else
                     {
                         handledFormat = false;
+                    }
+                    if (handledFormat && vn == 1u && vl != 3u)
+                    {
+                        // V2 writes X,Y,X,Y (PCSX2 Vif_Unpack.cpp:74-75).
+                        decompressed[2] = decompressed[0];
+                        decompressed[3] = decompressed[1];
+                    }
+                    if (handledFormat && vn == 2u && vl != 3u)
+                    {
+                        // V3 writes W from the next component, 0 past the buffer (real PS2: dma/vif/unpack).
+                        const uint32_t size = 4u >> vl;
+                        const uint8_t *w = srcVec + 3u * size;
+                        uint32_t value = 0u;
+                        if (w + size <= data + sizeBytes)
+                        {
+                            if (vl == 0u)
+                                std::memcpy(&value, w, 4u);
+                            else if (vl == 1u)
+                            {
+                                uint16_t raw;
+                                std::memcpy(&raw, w, 2u);
+                                value = extend16(raw);
+                            }
+                            else
+                                value = extend8(*w);
+                        }
+                        decompressed[3] = value;
                     }
 
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
@@ -745,7 +897,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     const bool canAdd = (vl != 3u || vn != 3u);
                     const uint32_t mode = vif1_regs.mode & 3u;
-                    if (handledFormat && !maskEnable && (!canAdd || mode == 0u || mode == 3u))
+                    if (handledFormat && !maskEnable && (!canAdd || mode == 0u))
                     {
                         std::memcpy(m_vu1Data + destOff, decompressed, sizeof(decompressed));
                         continue;
@@ -777,6 +929,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                     writeVal = writeVal + vif1_regs.row[field];
                                     if (mode == 2u)
                                         vif1_regs.row[field] = writeVal;
+                                }
+                                else if (canAdd && mode == 3u)
+                                {
+                                    vif1_regs.row[field] = writeVal;
                                 }
                             }
                         }
@@ -810,4 +966,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+    if (irqArmed)
+        vifInterrupt(1, irqOpcode);
+    return pos;
 }

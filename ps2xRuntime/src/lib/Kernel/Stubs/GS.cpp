@@ -27,6 +27,46 @@ namespace ps2_stubs
                    (static_cast<uint64_t>(static_cast<uint16_t>(y << 4)) << 16);
         }
 
+        // libgraph sceGszbufaddr: frame pages, doubled unless interlaced FIELD (Code Geass 0x13EE20).
+        int32_t gsZbufAddr(uint32_t psm, int32_t w, int32_t h)
+        {
+            const int32_t widthPages = (w + 63 < 0 ? w + 126 : w + 63) >> 6;
+            const int32_t heightPages = (psm & 2u) != 0u ? (h + 63 < 0 ? h + 126 : h + 63) >> 6
+                                                         : (h + 31 < 0 ? h + 62 : h + 31) >> 5;
+            const int32_t pages = widthPages * heightPages;
+            const bool field = g_gparam.interlace == 1u && g_gparam.ffmode == 0u;
+            return static_cast<int16_t>(field ? pages : pages * 2);
+        }
+
+        // libgraph sceGsSetDefDispEnv (Code Geass 0x13E9E8).
+        GsDispEnvMem makeDefGsDispEnv(uint32_t psm, int32_t w, int32_t h, int32_t dx, int32_t dy)
+        {
+            GsDispEnvMem env{};
+            env.pmode = 0x66u;
+            env.smode2 = g_gparam.interlace == 0u ? 2u : (g_gparam.ffmode != 0u ? 3u : 1u);
+            env.dispfb = (static_cast<uint64_t>(psm & 0xFu) << 15) |
+                         (static_cast<uint64_t>(((w + 63) >> 6) & 0x3F) << 9);
+            const bool frame = g_gparam.ffmode != 0u;
+            const int32_t dh = (g_gparam.interlace == 1u && frame) ? h * 2 - 1 : h - 1;
+            if ((g_gparam.omode == 2u || g_gparam.omode == 3u) && w > 0)
+            {
+                const bool pal = g_gparam.omode == 3u;
+                const int32_t magh = (w + 0x9FF) / w;
+                const int32_t baseY = g_gparam.interlace == 1u ? (pal ? 0x48 : 0x32) : (pal ? 0x24 : 0x19);
+                env.display = makeDisplay(static_cast<uint32_t>((pal ? 0x290 : 0x27C) + dx * magh),
+                                          static_cast<uint32_t>(dy + baseY), static_cast<uint32_t>(magh - 1), 0u,
+                                          static_cast<uint32_t>(magh * w - 1),
+                                          static_cast<uint32_t>(dh));
+            }
+            else if (g_gparam.omode == 0x50u)
+            {
+                env.display = makeDisplay(static_cast<uint32_t>((0x2D0 - w) / 2 * 2 + dx * 2 + 0xE8),
+                                          static_cast<uint32_t>(dy + 0x23), 1u, 0u, static_cast<uint32_t>(w * 2 - 1),
+                                          static_cast<uint32_t>(h - 1));
+            }
+            return env;
+        }
+
         void seedGsClearPacket(GsClearMem &clear,
                                int32_t width,
                                int32_t height,
@@ -123,7 +163,6 @@ namespace ps2_stubs
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
         }
 
-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr);
 
         void initPacketBuilderState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -159,6 +198,19 @@ namespace ps2_stubs
             }
 
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
+            // Close the open DMA tag once: QWC += qwords after it (libgraph, Code Geass 0x15BF40).
+            uint32_t tagAddr = 0u;
+            uint32_t tagWord = 0u;
+            if (tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, tagAddr) && tagAddr != 0u &&
+                tryReadWordFromGuest(rdram, runtime, tagAddr, tagWord))
+            {
+                tagWord += static_cast<uint32_t>((static_cast<int32_t>(currentAddr - tagAddr) >> 4) - 1);
+                writeGuestBytes(rdram,
+                                runtime,
+                                tagAddr,
+                                reinterpret_cast<const uint8_t *>(&tagWord),
+                                sizeof(tagWord));
+            }
             writeGuestBytes(rdram,
                             runtime,
                             stateAddr + 8u,
@@ -228,39 +280,9 @@ namespace ps2_stubs
                             sizeof(temp));
         }
 
-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr)
-        {
-            uint32_t currentAddr = 0u;
-            uint32_t pendingCountAddr = 0u;
-            if (!tryReadWordFromGuest(rdram, runtime, stateAddr, currentAddr) ||
-                !tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, pendingCountAddr) ||
-                pendingCountAddr == 0u ||
-                currentAddr <= pendingCountAddr)
-            {
-                return;
-            }
-
-            uint32_t countWord = 0u;
-            if (!tryReadWordFromGuest(rdram, runtime, pendingCountAddr, countWord))
-            {
-                return;
-            }
-
-            const uint32_t deltaBytes = currentAddr - pendingCountAddr;
-            uint32_t deltaQwords = 0u;
-            if (deltaBytes >= 16u)
-            {
-                deltaQwords = (deltaBytes >> 4u) - 1u;
-            }
-
-            countWord = (countWord & 0xFFFF0000u) | (deltaQwords & 0xFFFFu);
-            writeGuestU32(rdram, runtime, pendingCountAddr, countWord);
-        }
-
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
         {
             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
         }
 
         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
@@ -632,7 +654,8 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // dbp is already a BITBLTBUF block address (sceGsSetDefLoadImage; Code Geass TBP0 0x1EA4).
+        uint32_t dbp = static_cast<uint32_t>(img.vram_addr);
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 
@@ -697,7 +720,8 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // Block address, as for sceGsExecLoadImage.
+        uint32_t sbp = static_cast<uint32_t>(img.vram_addr);
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -859,42 +883,25 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
-        const uint64_t smode2 =
-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
-
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(psm, drawWidth, drawHeight));
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
-
-        const uint32_t fbp1 = zbufAddr;
-        const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
-        const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
-
+        // libgraph (Code Geass 0x13FD68): buffer 1 at page zbufaddr / 2, except in interlaced FIELD mode.
         GsDBuffDcMem db{};
-        db.disp[0].pmode = pmode;
-        db.disp[0].smode2 = smode2;
-        db.disp[0].dispfb = dispfb0;
-        db.disp[0].display = display;
-        db.disp[0].bgcolor = 0u;
+        db.disp[0] = makeDefGsDispEnv(psm, drawWidth, drawHeight, 0, 0);
         db.disp[1] = db.disp[0];
-        db.disp[1].dispfb = dispfb1;
+        const bool twoBuffers = (g_gparam.interlace == 1u && g_gparam.ffmode == 1u) || g_gparam.interlace == 0u;
+        const uint32_t fbp1 = twoBuffers ? ((zbufAddr >> 1) & 0x1FFu) : 0u;
+        db.disp[1].dispfb |= fbp1;
 
         const bool seedClear = clear != 0u;
         db.giftag0 = {makeGiftagAplusD(seedClear ? 22u : 16u), 0xEULL};
-        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         if (seedClear)
         {
             seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
@@ -940,12 +947,7 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(psm, drawWidth, drawHeight));
 
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
@@ -1020,8 +1022,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = gsZbufAddr(psm, w, h);
 
         GsDrawEnv1Mem env{};
         seedGsDrawEnv1(env,
@@ -1063,8 +1064,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = gsZbufAddr(psm, w, h);
 
         GsDrawEnv2Mem env{};
         seedGsDrawEnv2(env,
@@ -1301,47 +1301,11 @@ namespace ps2_stubs
     void sceGszbufaddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        uint32_t param_1 = getRegU32(ctx, 4);
-        int32_t w = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF));
-        int32_t h = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFF));
-
-        int32_t width_blocks = (w + 63) >> 6;
-        if (w + 63 < 0)
-            width_blocks = (w + 126) >> 6;
-
-        int32_t height_blocks;
-        if ((param_1 & 2) != 0)
-        {
-            int32_t v = (h + 63) >> 6;
-            if (h + 63 < 0)
-                v = (h + 126) >> 6;
-            height_blocks = v;
-        }
-        else
-        {
-            int32_t v = (h + 31) >> 5;
-            if (h + 31 < 0)
-                v = (h + 62) >> 5;
-            height_blocks = v;
-        }
-
-        int32_t product = width_blocks * height_blocks;
-
-        uint64_t gparam_val = 0;
-        if (runtime)
-        {
-            uint8_t *scratch = runtime->memory().getScratchpad();
-            if (scratch)
-            {
-                std::memcpy(&gparam_val, scratch + 0x100, sizeof(gparam_val));
-            }
-        }
-        if ((gparam_val & 0xFFFF0000FFFFULL) == 1ULL)
-            product = (product * 0x10000) >> 16;
-        else
-            product = (product * 0x20000) >> 16;
-
-        setReturnS32(ctx, product);
+        (void)runtime;
+        // sceGszbufaddr(psm, w, h) in a0..a2 (Code Geass 0x13EE20).
+        setReturnS32(ctx, gsZbufAddr(getRegU32(ctx, 4),
+                                     static_cast<int16_t>(getRegU32(ctx, 5) & 0xFFFFu),
+                                     static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFFu)));
     }
 
     void Ps2SwapDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
