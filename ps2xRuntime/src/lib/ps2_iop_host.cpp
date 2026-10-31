@@ -101,9 +101,32 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
     return CallScope(*this, context, rdram);
 }
 
+namespace
+{
+    // EE RAM (any kseg alias) or the scratchpad; getMemPtr wraps any other address into RAM.
+    bool isEeMemoryAddress(uint32_t address)
+    {
+        if (ps2IsScratchpadAddress(address))
+            return true;
+        uint32_t phys = address;
+        if ((address >= 0x20000000u && address < 0x40000000u) ||
+            (address >= 0x80000000u && address < 0xC0000000u))
+            phys = address & 0x1FFFFFFFu;
+        else if (address >= 0x20000000u)
+            return false;
+        return phys < PS2_RAM_SIZE;
+    }
+}
+
 bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
 {
     begin = nullptr;
+    if (!isEeMemoryAddress(address) ||
+        (size != 0 && (size - 1 > std::numeric_limits<uint32_t>::max() - address ||
+                       !isEeMemoryAddress(address + static_cast<uint32_t>(size - 1)))))
+    {
+        return false;
+    }
     uint8_t *const rdram = m_activeRdram
                                ? m_activeRdram
                                : m_runtime.memory().getRDRAM();

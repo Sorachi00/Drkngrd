@@ -847,20 +847,22 @@ namespace
         {
         }
 
+        // EE gcc varargs use one 8-byte slot per argument (guest newlib vfprintf: ap += 8).
         uint32_t nextU32()
         {
             uint32_t value = 0;
             (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, value);
-            m_curr += 4;
+            m_curr += 8;
             return value;
         }
 
         uint64_t nextU64()
         {
-            m_curr = (m_curr + 7u) & ~7u;
-            const uint64_t low = nextU32();
-            const uint64_t high = nextU32();
-            return low | (high << 32);
+            uint32_t low = 0, high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr + 4u, high);
+            m_curr += 8;
+            return low | (static_cast<uint64_t>(high) << 32);
         }
 
     private:
@@ -1373,6 +1375,8 @@ namespace
         }
 
         PS2Memory &mem = runtime->memory();
+        // Keep the game's TTE bit 6 (ps2sdk ee/dma/include/dma_registers.h DMA_SET_CHCR).
+        chcr |= mem.readIORegister(channelBase + 0x00u) & 0x40u;
         mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);

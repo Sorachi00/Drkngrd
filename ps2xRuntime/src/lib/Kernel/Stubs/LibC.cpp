@@ -955,7 +955,8 @@ namespace ps2_stubs
         constexpr float kPi = 3.14159265358979323846f;
         constexpr float kHalfPi = kPi * 0.5f;
         constexpr float kInvHalfPi = 2.0f / kPi;
-        const int32_t n = static_cast<int32_t>(std::nearbyintf(x * kInvHalfPi));
+        // std::round, not nearbyintf: the game thread runs with round-toward-zero.
+        const int32_t n = static_cast<int32_t>(std::round(x * kInvHalfPi));
         const float y0 = x - (static_cast<float>(n) * kHalfPi);
         const float y1 = 0.0f;
 

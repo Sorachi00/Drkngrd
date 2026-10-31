@@ -35,10 +35,20 @@ namespace ps2_stubs
 
     void fstat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // ps2sdk newlib struct stat: 88 bytes, st_mode (u32) at +4.
+        constexpr size_t kStatSize = 88u;
+        constexpr uint32_t kStModeOffset = 4u;
+        constexpr uint32_t kS_IFCHR = 0x2000u;
+        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         uint32_t statAddr = getRegU32(ctx, 5);
         if (uint8_t *statBuf = getMemPtr(rdram, statAddr))
         {
-            std::memset(statBuf, 0, 128);
+            std::memset(statBuf, 0, kStatSize);
+            if (fd >= 0 && fd <= 2)
+            {
+                // tty: a character device, so newlib line-buffers stdout.
+                std::memcpy(statBuf + kStModeOffset, &kS_IFCHR, sizeof(kS_IFCHR));
+            }
             setReturnS32(ctx, 0);
             return;
         }
