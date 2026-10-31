@@ -2,11 +2,13 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_video_timing.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace
@@ -31,7 +33,6 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -50,7 +51,20 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    uint32_t fieldMicroseconds()
+    {
+        return PS2VideoTiming::pal() ? 20000u : 16667u;
+    }
+
+    std::chrono::microseconds vblankPeriod()
+    {
+        return std::chrono::microseconds(fieldMicroseconds());
+    }
+
+    uint64_t vblankPeriodCycles()
+    {
+        return microsecondsToEeCycles(fieldMicroseconds());
+    }
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -147,8 +161,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + vblankPeriodCycles(),
+                  std::chrono::steady_clock::now() + vblankPeriod(),
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -402,8 +416,11 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // The EE kernel does not time-slice equal priorities (ps2sdk ee/kernel/src/thread.c:
+    // round robin only by RotateThreadReadyQueue): only a higher priority preempts.
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr && running->currentPriority > 0 &&
+        hasReadyAtOrAbovePriority(running->currentPriority - 1))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
@@ -448,7 +465,7 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    if (params.priority < 0 || params.priority >= kPriorityCount) // 0 is valid (ps2sdk ee/kernel/src/thread.c)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -598,14 +615,19 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
     {
         return KE_DORMANT;
     }
+    // EE suspends do not nest (real PS2: ps2autotests kernel/ee/thread/suspend).
+    if (target->status == EeThreadStatus::Suspended || target->status == EeThreadStatus::WaitingSuspended)
+    {
+        return KE_ERROR;
+    }
 
     ++target->suspendCount;
     switch (target->status)
     {
     case EeThreadStatus::Running:
+        // Keeps running with status SUSPEND until it waits (fps2bios eekernel.c _SuspendThread;
+        // real PS2: ps2autotests kernel/ee/thread/suspend).
         target->status = EeThreadStatus::Suspended;
-        m_currentThreadId = 0;
-        m_rescheduleRequested = true;
         break;
     case EeThreadStatus::Ready:
         removeReady(*target);
@@ -653,6 +675,10 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     {
         target->status = EeThreadStatus::Waiting;
     }
+    else if (target->status == EeThreadStatus::Suspended && target->id == m_currentThreadId)
+    {
+        target->status = EeThreadStatus::Running;
+    }
     else if (target->status == EeThreadStatus::Suspended)
     {
         enqueueReady(*target);
@@ -662,15 +688,28 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     return KE_OK;
 }
 
+void EeScheduler::clearSelfSuspend()
+{
+    assertExecutor();
+    GuestThread *self = currentThread();
+    if (self && self->status == EeThreadStatus::Suspended)
+    {
+        self->suspendCount = 0;
+        self->status = EeThreadStatus::Running;
+        publishSnapshot();
+    }
+}
+
 void EeScheduler::sleepCurrent()
 {
     assertExecutor();
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    // SleepThread returns the own id (real PS2: ps2autotests kernel/ee/thread/sleep).
     if (self->wakeupCount != 0u)
     {
         --self->wakeupCount;
-        setReturnS32(&self->activeContext(), KE_OK);
+        setReturnS32(&self->activeContext(), self->id);
         return;
     }
     blockCurrent(EeWaitState{EeWaitReason::Sleep, std::monostate{}});
@@ -679,6 +718,15 @@ void EeScheduler::sleepCurrent()
 int EeScheduler::wakeupThread(int id, bool interruptSafe)
 {
     assertExecutor();
+    // A handler that wakes the interrupted thread raises its wakeup count (ps2sdk ee/kernel/src/thread.c).
+    if (interruptSafe && id != 0 && id == m_currentThreadId)
+    {
+        if (GuestThread *self = thread(id))
+        {
+            ++self->wakeupCount;
+            return KE_OK;
+        }
+    }
     if (id == 0 || id == m_currentThreadId)
     {
         return KE_ILLEGAL_THID;
@@ -695,7 +743,7 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
-        makeReady(*target, KE_OK, interruptSafe);
+        makeReady(*target, target->id, interruptSafe);
     }
     else
     {
@@ -726,7 +774,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount) // 0 is valid (ps2sdk ee/kernel/src/osdsrc/src/ExecPS2.c)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1196,19 +1244,44 @@ uint32_t EeScheduler::invocationStackTop()
         return existing->second;
     }
     constexpr uint32_t kInvocationStackSize = 0x4000u;
-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
-    if (top == 0u)
+    for (auto it = m_invocationStackTops.begin(); it != m_invocationStackTops.end(); ++it)
     {
-        throw std::runtime_error("EE invocation stack space exhausted");
+        const GuestThread *user = thread(static_cast<int>(static_cast<uint32_t>(it->first >> 32u)));
+        if (!user || user->invocations.size() <= static_cast<size_t>(static_cast<uint32_t>(it->first)))
+        {
+            const uint32_t reused = it->second;
+            m_invocationStackTops.erase(it);
+            m_invocationStackTops.emplace(key, reused);
+            return reused;
+        }
     }
-    m_invocationStackTops.emplace(key, top);
-    return top;
+    uint32_t avoidLo = 0u, avoidHi = 0u;
+    if (const GuestThread *mainThread = thread(kMainThreadId); mainThread && mainThread->stackSize != 0u)
+    {
+        avoidLo = mainThread->stack > mainThread->stackSize ? mainThread->stack - mainThread->stackSize : 0u;
+        avoidHi = mainThread->stack + mainThread->stackSize;
+    }
+    for (int attempt = 0; attempt < 256; ++attempt)
+    {
+        const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+        if (top == 0u)
+        {
+            break;
+        }
+        if (top + 0x10u > avoidLo && top + 0x10u - kInvocationStackSize < avoidHi)
+        {
+            continue;
+        }
+        m_invocationStackTops.emplace(key, top);
+        return top;
+    }
+    throw std::runtime_error("EE invocation stack space exhausted");
 }
 
 int EeScheduler::addIrqHandler(bool dmac,
                                uint32_t cause,
                                uint32_t handler,
-                               bool append,
+                               int32_t next,
                                uint32_t argument,
                                uint32_t gp,
                                uint32_t sp)
@@ -1223,6 +1296,29 @@ int EeScheduler::addIrqHandler(bool dmac,
     }
     int &head = dmac ? m_dmacHeadOrder : m_intcHeadOrder;
     int &tail = dmac ? m_dmacTailOrder : m_intcTailOrder;
+    // next: 0 = first, -1 = last, a handler id = just before it (real PS2: ps2autotests
+    // kernel/ee/interrupt dmac_order/intc_order).
+    int order = 0;
+    const auto before = next > 0 ? handlers.find(next) : handlers.end();
+    if (next == 0)
+    {
+        order = --head;
+    }
+    else if (before != handlers.end() && before->second.cause == cause)
+    {
+        order = before->second.order;
+        for (auto &[otherId, other] : handlers)
+        {
+            (void)otherId;
+            if (other.cause == cause && other.order >= order)
+                ++other.order;
+        }
+        ++tail;
+    }
+    else
+    {
+        order = ++tail;
+    }
     handlers.emplace(id,
                      EeIrqHandler{id,
                                   cause,
@@ -1231,7 +1327,7 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   gp,
                                   sp,
                                   true,
-                                  append ? ++tail : --head});
+                                  order});
     return id;
 }
 
@@ -1298,8 +1394,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
-    for (const EeIrqHandler &handler : matching)
+    if (matching.empty())
     {
+        return;
+    }
+    // The handlers run one after another; a negative return stops the rest (real PS2:
+    // ps2autotests kernel/ee/interrupt *_order). The next one goes to the queue front.
+    auto chain = std::make_shared<std::vector<EeIrqHandler>>(std::move(matching));
+    auto queueAt = [this, cause, chain](auto &self, size_t index, bool front) -> void
+    {
+        const EeIrqHandler &handler = (*chain)[index];
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Interrupt;
         invocation.context.pc = handler.handler;
@@ -1308,8 +1412,26 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 28, handler.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        queueInvocation(std::move(invocation));
-    }
+        if (index + 1u < chain->size())
+        {
+            invocation.onComplete = [self, index](const R5900Context &done, R5900Context &)
+            {
+                if (static_cast<int32_t>(getRegU32(&done, 2)) >= 0)
+                    self(self, index + 1u, true);
+            };
+        }
+        if (front)
+        {
+            invocation.sequence = ++m_invocationSequence;
+            m_pendingInvocations.push_front(std::move(invocation));
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
+        else
+        {
+            queueInvocation(std::move(invocation));
+        }
+    };
+    queueAt(queueAt, 0u, false);
 }
 
 void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
@@ -1607,6 +1729,10 @@ GuestThread &EeScheduler::acquireInvocationThread()
 void EeScheduler::enqueueReady(GuestThread &item, bool front)
 {
     assert(item.currentPriority >= 0 && item.currentPriority < kPriorityCount);
+    if (item.status == EeThreadStatus::Suspended && item.id == m_currentThreadId)
+    {
+        return;
+    }
     item.status = EeThreadStatus::Ready;
     auto &queue = m_readyQueues[item.currentPriority];
     if (front)
@@ -1663,6 +1789,8 @@ void EeScheduler::makeDormant(GuestThread &item)
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
+    // Back at its initial priority (real PS2: ps2autotests kernel/ee/thread/exit, terminate).
+    item.currentPriority = item.initialPriority;
     item.wait = {};
     item.resumeCompletion = {};
     item.suspendCount = 0;
@@ -1705,6 +1833,8 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     GuestThread *self = currentThread();
     assert(self != nullptr);
     self->wait = std::move(wait);
+    if (self->status == EeThreadStatus::Suspended)
+        self->suspendCount = 0;
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
@@ -1800,6 +1930,17 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    const GuestThread *runningThread = m_currentThreadId != 0 ? currentThread() : nullptr;
+    const bool inHandler = runningThread &&
+                           std::any_of(runningThread->invocations.begin(), runningThread->invocations.end(),
+                                       [](const GuestInvocation &invocation)
+                                       { return invocation.started &&
+                                                (invocation.kind == GuestInvocationKind::Interrupt ||
+                                                 invocation.kind == GuestInvocationKind::GsCallback); });
+    auto held = [inHandler](const ScheduledEvent &item)
+    {
+        return inHandler && (item.event.type == EeEventType::VBlankStart || item.event.type == EeEventType::VBlankEnd);
+    };
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -1809,7 +1950,7 @@ void EeScheduler::processDueDeadlines()
             const auto now = std::chrono::steady_clock::now();
             for (const ScheduledEvent &item : m_deadlines)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
+                if (item.deadlineCycle <= m_eeCycle && !held(item) &&
                     (pacingDeadline == std::chrono::steady_clock::time_point{} ||
                      item.hostDeadline < pacingDeadline))
                 {
@@ -1820,6 +1961,14 @@ void EeScheduler::processDueDeadlines()
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
             {
                 updateNextDeadline();
+                if (inHandler)
+                {
+                    uint64_t next = 0u;
+                    for (const ScheduledEvent &item : m_deadlines)
+                        if (!held(item) && (next == 0u || item.deadlineCycle < next))
+                            next = item.deadlineCycle;
+                    m_nextDeadlineCycle.store(next, std::memory_order_release);
+                }
                 return;
             }
 
@@ -1837,8 +1986,8 @@ void EeScheduler::processDueDeadlines()
 
             const auto pacedNow = std::chrono::steady_clock::now();
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
-                                              [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
+                                              [this, pacedNow, &held](const ScheduledEvent &item)
+                                              { return item.deadlineCycle <= m_eeCycle && !held(item) &&
                                                        item.hostDeadline <= pacedNow; });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
@@ -1874,13 +2023,13 @@ void EeScheduler::processDueDeadlines()
             {
                 const auto now = std::chrono::steady_clock::now();
                 // Discard missed frames without accumulating timer jitter.
-                const auto deliveredAt = now - scheduled.hostDeadline >= kVBlankPeriod
+                const auto deliveredAt = now - scheduled.hostDeadline >= vblankPeriod()
                                              ? now : scheduled.hostDeadline;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               deliveredAt + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              deliveredAt + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
+                              deliveredAt + vblankPeriod(),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -1955,7 +2104,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         SET_GPR_U32(&invocation.context, 5, static_cast<uint32_t>(alarm.ticks));
         SET_GPR_U32(&invocation.context, 6, alarm.argument);
         SET_GPR_U32(&invocation.context, 28, alarm.gp);
-        SET_GPR_U32(&invocation.context, 29, alarm.sp);
+        // The kernel keeps only gp for an alarm and runs it on the interrupt stack (ps2sdk
+        // ee/kernel/src/srcfile/src/alarm.c): sp = 0 selects the invocation stack.
+        SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
         break;
@@ -2139,5 +2290,29 @@ void EeScheduler::copyMainContextToRuntime()
     if (main)
     {
         m_runtime.m_cpuContext = main->context;
+    }
+}
+
+namespace PS2VideoTiming
+{
+    namespace
+    {
+        std::atomic<bool> g_displayPal{false};
+        std::atomic<bool> g_movieActive{false};
+    }
+
+    void setDisplayPal(bool pal)
+    {
+        g_displayPal.store(pal, std::memory_order_release);
+    }
+
+    void setMovieActive(bool active)
+    {
+        g_movieActive.store(active, std::memory_order_release);
+    }
+
+    bool pal()
+    {
+        return g_displayPal.load(std::memory_order_acquire) && g_movieActive.load(std::memory_order_acquire);
     }
 }

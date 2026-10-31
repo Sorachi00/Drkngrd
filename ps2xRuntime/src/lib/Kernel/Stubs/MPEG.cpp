@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_video_timing.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -611,8 +612,9 @@ namespace ps2_stubs
 
             const uint64_t extensionNumerator = static_cast<uint64_t>(frameRateExtensionN) + 1u;
             const uint64_t extensionDenominator = static_cast<uint64_t>(frameRateExtensionD) + 1u;
-            const uint64_t denominator = 1001u * frameRateNumerator * extensionNumerator;
-            const uint64_t numerator = (60000u * frameRateDenominator * extensionDenominator) << 32u;
+            const bool pal = PS2VideoTiming::pal();
+            const uint64_t denominator = (pal ? 1u : 1001u) * frameRateNumerator * extensionNumerator;
+            const uint64_t numerator = ((pal ? 50u : 60000u) * frameRateDenominator * extensionDenominator) << 32u;
             return std::max(kPictureClockOne, (numerator + denominator / 2u) / denominator);
         }
 
@@ -744,11 +746,13 @@ namespace ps2_stubs
         {
             // 90 kHz MPEG clock -> NTSC field clock (60000/1001 Hz):
             // fields = pts * 60000 / (90000 * 1001) = pts * 2 / 3003.
-            constexpr uint64_t kPtsDivisor = 3003u;
+            const bool pal = PS2VideoTiming::pal();
+            const uint64_t kPtsDivisor = pal ? 1800u : 3003u;
+            const uint64_t fieldsPerDivisor = pal ? 1u : 2u;
             const uint64_t whole = delta90k / kPtsDivisor;
             const uint64_t remainder = delta90k % kPtsDivisor;
-            const uint64_t wholeQ32 = whole * 2u * kPictureClockOne;
-            const uint64_t remainderQ32 = ((remainder * 2u * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
+            const uint64_t wholeQ32 = whole * fieldsPerDivisor * kPictureClockOne;
+            const uint64_t remainderQ32 = ((remainder * fieldsPerDivisor * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
             return wholeQ32 + remainderQ32;
         }
 
@@ -2024,6 +2028,7 @@ namespace ps2_stubs
 
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        PS2VideoTiming::setMovieActive(true);
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -2102,6 +2107,7 @@ namespace ps2_stubs
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
+        PS2VideoTiming::setMovieActive(false);
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
     }
@@ -2542,6 +2548,7 @@ namespace ps2_stubs
     {
         (void)runtime;
         const uint32_t param_1 = getRegU32(ctx, 4);
+        PS2VideoTiming::setMovieActive(false);
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);

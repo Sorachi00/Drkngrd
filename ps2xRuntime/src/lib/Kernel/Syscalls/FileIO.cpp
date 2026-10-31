@@ -42,8 +42,10 @@ namespace ps2_syscalls
 
     static const char *translateFioMode(int ps2Flags)
     {
-        bool read = (ps2Flags & PS2_FIO_O_RDONLY) || (ps2Flags & PS2_FIO_O_RDWR);
-        bool write = (ps2Flags & PS2_FIO_O_WRONLY) || (ps2Flags & PS2_FIO_O_RDWR);
+        // The access mode is a 2-bit field (ps2sdk common/include/io_common.h).
+        const int access = ps2Flags & PS2_FIO_O_RDWR;
+        bool read = access == PS2_FIO_O_RDONLY || access == PS2_FIO_O_RDWR;
+        bool write = access == PS2_FIO_O_WRONLY || access == PS2_FIO_O_RDWR;
         bool append = (ps2Flags & PS2_FIO_O_APPEND);
         bool create = (ps2Flags & PS2_FIO_O_CREAT);
         bool truncate = (ps2Flags & PS2_FIO_O_TRUNC);
@@ -252,6 +254,8 @@ namespace ps2_syscalls
 
     void fioWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime)
+            runtime->eeScheduler().clearSelfSuspend();
         int ps2Fd = (int)getRegU32(ctx, 4);   // $a0
         uint32_t bufAddr = getRegU32(ctx, 5); // $a1
         size_t size = getRegU32(ctx, 6);      // $a2
@@ -264,6 +268,12 @@ namespace ps2_syscalls
         }
 
         FILE *fp = getHostFile(ps2Fd);
+        // fd 1/2 are the tty (ps2sdk libcglue); host fds start at 3.
+        const bool tty = !fp && (ps2Fd == 1 || ps2Fd == 2);
+        if (tty)
+        {
+            fp = (ps2Fd == 1) ? stdout : stderr;
+        }
         if (!fp)
         {
             setReturnS32(ctx, -1); // -EFAULT
@@ -285,6 +295,10 @@ namespace ps2_syscalls
                 clearerr(fp);
                 setReturnS32(ctx, -1); // -EIO, -ENOSPC etc.
                 return;
+            }
+            if (tty)
+            {
+                fflush(fp);
             }
         }
 

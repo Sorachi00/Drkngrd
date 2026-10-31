@@ -289,6 +289,7 @@ public:
     int terminateThread(int id, uint32_t &ownedStack, bool interruptSafe);
     int suspendThread(int id, bool interruptSafe);
     int resumeThread(int id, bool interruptSafe);
+    void clearSelfSuspend();
     void sleepCurrent();
     int wakeupThread(int id, bool interruptSafe);
     int cancelWakeup(int id);
@@ -321,7 +322,7 @@ public:
     int addIrqHandler(bool dmac,
                       uint32_t cause,
                       uint32_t handler,
-                      bool append,
+                      int32_t next,
                       uint32_t argument,
                       uint32_t gp,
                       uint32_t sp);

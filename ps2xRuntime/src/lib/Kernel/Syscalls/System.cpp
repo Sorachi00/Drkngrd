@@ -162,7 +162,9 @@ namespace ps2_syscalls
             raw = makeReadableOsdConfig2RawLocked();
         }
 
-        const uint32_t copyBytes = std::min<uint32_t>(size, 4u);
+        // Arg 3 is a byte offset into the 128-byte config block (ps2sdk ee/kernel/src/osdsrc/src/osd.c).
+        const uint32_t offset = std::min<uint32_t>(getRegU32(ctx, 6), 0x80u);
+        const uint32_t copyBytes = std::min<uint32_t>(size, 0x80u - offset);
         uint8_t rawBytes[4] = {
             static_cast<uint8_t>(raw & 0xFFu),
             static_cast<uint8_t>((raw >> 8) & 0xFFu),
@@ -180,7 +182,8 @@ namespace ps2_syscalls
                 setReturnS32(ctx, -1);
                 return;
             }
-            rawBytes[i] = *src;
+            if (offset + i < 4u)
+                rawBytes[offset + i] = *src;
         }
 
         raw = static_cast<uint32_t>(rawBytes[0]) |
@@ -195,9 +198,9 @@ namespace ps2_syscalls
 
             uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
             uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
-            if (copyBytes >= 3u)
+            if (offset <= 2u && offset + copyBytes > 2u)
                 version = (raw >> 16) & 0xFFu;
-            if (copyBytes >= 4u)
+            if (offset <= 3u && offset + copyBytes > 3u)
                 language = (raw >> 24) & 0xFFu;
             g_osd_config_raw = syncOsdConfigRawVersionLanguage(g_osd_config_raw, version, language);
             g_osd_config_initialized = true;
@@ -232,7 +235,9 @@ namespace ps2_syscalls
             static_cast<uint8_t>((raw >> 16) & 0xFFu),
             static_cast<uint8_t>((raw >> 24) & 0xFFu),
         };
-        const uint32_t copyBytes = std::min<uint32_t>(size, 4u);
+        // Arg 3 is a byte offset (osd.c); Drakengard reads byte 1 with GetOsdConfigParam2(p, 1, 1).
+        const uint32_t offset = std::min<uint32_t>(getRegU32(ctx, 6), 0x80u);
+        const uint32_t copyBytes = std::min<uint32_t>(size, 0x80u - offset);
 
         for (uint32_t i = 0; i < copyBytes; ++i)
         {
@@ -244,7 +249,7 @@ namespace ps2_syscalls
                 setReturnS32(ctx, -1);
                 return;
             }
-            *dst = rawBytes[i];
+            *dst = (offset + i < 4u) ? rawBytes[offset + i] : 0u;
         }
 
         setReturnS32(ctx, 0);
@@ -424,8 +429,9 @@ namespace ps2_syscalls
 
         if (!runtime->hasFunction(handler))
         {
-            setReturnS32(ctx, KE_ERROR);
-            return true;
+            // Kernel code we did not recompile (e.g. SetSyscall(0x5B, 0x80075000) in
+            // InitTLBFunctions, ps2sdk ee/kernel/src/tlbfunc.c): run the built-in HLE.
+            return false;
         }
 
         GuestInvocation invocation{};

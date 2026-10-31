@@ -32,7 +32,7 @@ namespace ps2_syscalls
                                .addIrqHandler(dmac,
                                               getRegU32(ctx, 4),
                                               getRegU32(ctx, 5),
-                                              getRegU32(ctx, 6) != 0u,
+                                              static_cast<int32_t>(getRegU32(ctx, 6)),
                                               getRegU32(ctx, 7),
                                               getRegU32(ctx, 28),
                                               getRegU32(ctx, 29));

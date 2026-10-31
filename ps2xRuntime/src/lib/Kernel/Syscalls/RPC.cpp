@@ -219,12 +219,13 @@ namespace ps2_syscalls
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (runtime)
-        {
-            PS2IopTransport::reset(runtime);
-        }
         if (!g_rpc_initialized)
         {
+            // A second SifInitRpc does nothing (ps2sdk ee/kernel/src/sifrpc.c "if (init) return;").
+            if (runtime)
+            {
+                PS2IopTransport::reset(runtime);
+            }
             g_rpc_servers.clear();
             g_rpc_clients.clear();
             g_rpc_next_id = 1;
@@ -340,6 +341,8 @@ namespace ps2_syscalls
         const uint32_t mode = getRegU32(ctx, 6);
         const uint32_t sendBuf = getRegU32(ctx, 7);
         const uint32_t stackPointer = getRegU32(ctx, 29);
+        if (runtime && !(mode & kSifRpcModeNowait))
+            runtime->eeScheduler().clearSelfSuspend();
 
         const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
         const uint32_t receiveBufferRegisters = getRegU32(ctx, 9);
@@ -700,14 +703,10 @@ namespace ps2_syscalls
         uint32_t sid = getRegU32(ctx, 5);
         uint32_t func = getRegU32(ctx, 6);
         uint32_t buf = getRegU32(ctx, 7);
-        // stack args: cfunc, cbuf, qd...
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t cfunc = 0;
-        uint32_t cbuf = 0;
-        uint32_t qd = 0;
-        readStackU32(rdram, sp, 0x10, cfunc);
-        readStackU32(rdram, sp, 0x14, cbuf);
-        readStackU32(rdram, sp, 0x18, qd);
+        // cfunc, cbuf, qd are args 5-7: t0-t2 in the EE ABI (ps2sdk common/include/sifrpc-common.h).
+        uint32_t cfunc = getRegU32(ctx, 8);
+        uint32_t cbuf = getRegU32(ctx, 9);
+        uint32_t qd = getRegU32(ctx, 10);
 
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
@@ -967,11 +966,9 @@ namespace ps2_syscalls
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+        // dest/size of the extra data are args 5-6: t0/t1 in the EE ABI (ps2sdk ee/kernel/include/sifcmd.h).
+        uint32_t destExtra = getRegU32(ctx, 8);
+        uint32_t sizeExtra = getRegU32(ctx, 9);
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {

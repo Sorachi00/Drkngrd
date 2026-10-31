@@ -58,12 +58,15 @@ namespace ps2_syscalls
         case static_cast<uint32_t>(-0x1D):
             iDisableDmac(rdram, ctx, runtime);
             return true;
+        // The kernel indexes its table by |v1| (ps2sdk ee/kernel/src/alarm.c: 0xFC-0xFF).
         case 0x18:
         case 0xFC:
+        case 0xFD:
             SetAlarm(rdram, ctx, runtime);
             return true;
         case 0x19:
         case 0xFE:
+        case static_cast<uint32_t>(-0xFE):
             CancelAlarm(rdram, ctx, runtime);
             return true;
         case static_cast<uint32_t>(-0x1E):
@@ -159,6 +162,7 @@ namespace ps2_syscalls
         case 0x41:
             DeleteSema(rdram, ctx, runtime);
             return true;
+        case 0x49:
         case static_cast<uint32_t>(-0x49):
             iDeleteSema(rdram, ctx, runtime);
             return true;
@@ -198,30 +202,11 @@ namespace ps2_syscalls
         case 0x52:
             SetEventFlag(rdram, ctx, runtime);
             return true;
+        case 0x53: // __NR_iSetEventFlag is +0x53 (ps2sdk syscallnr.h)
         case static_cast<uint32_t>(-0x53):
             iSetEventFlag(rdram, ctx, runtime);
             return true;
-        case 0x54:
-            ClearEventFlag(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x55):
-            iClearEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x56:
-            WaitEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x57:
-            PollEventFlag(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x58):
-            iPollEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x59:
-            ReferEventFlagStatus(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x5A):
-            iReferEventFlagStatus(rdram, ctx, runtime);
-            return true;
+        // 0x54-0x59 are xlaunch and the TLB calls, not event flags (ps2sdk syscallnr.h).
         case 0x5A:
             Copy(rdram, ctx, runtime);
             return true;

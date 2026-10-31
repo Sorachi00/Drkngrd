@@ -143,7 +143,7 @@ namespace ps2_syscalls
         status->wait_threads = static_cast<int>(semaphore->waiters.size());
         status->attr = semaphore->attr;
         status->option = semaphore->option;
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, semaphore->id); // ps2sdk libpthreadglue osal.c compares the result with the sema id
     }
 
     void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
