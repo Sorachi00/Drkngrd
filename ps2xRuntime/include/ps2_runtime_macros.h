@@ -267,9 +267,39 @@ static inline __m128 Ps2VuMin(__m128 a, __m128 b)
 
 #define PS2_VU0_MAC_UPDATE(ctx, res, mask) Ps2Vu0MacUpdate((ctx)->vu0_mac_flags, (ctx)->vu0_status, (res), (mask))
 
+// The VU adder keeps one guard bit: the smaller operand loses its bits below it
+// (real PS2: ps2autotests vu/games/triace; PCSX2 PR #12001 PS2Float::Add).
+static inline uint32_t Ps2VuDropBitsBelowGuard(uint32_t bits, int shift)
+{
+    if (shift >= 25)
+        return bits & PS2_FLOAT_SIGN_MASK;
+    if (shift >= 2)
+        return bits & (~0u << (shift - 1));
+    return bits;
+}
+
+static inline __m128 Ps2VuAdd(__m128 a, __m128 b)
+{
+    alignas(16) uint32_t x[4];
+    alignas(16) uint32_t y[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(x), _mm_castps_si128(a));
+    _mm_store_si128(reinterpret_cast<__m128i *>(y), _mm_castps_si128(b));
+    for (int i = 0; i < 4; ++i)
+    {
+        const int difference = static_cast<int>((x[i] >> 23) & 0xFFu) - static_cast<int>((y[i] >> 23) & 0xFFu);
+        if (difference > 0)
+            y[i] = Ps2VuDropBitsBelowGuard(y[i], difference);
+        else
+            x[i] = Ps2VuDropBitsBelowGuard(x[i], -difference);
+    }
+    const __m128 alignedA = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i *>(x)));
+    const __m128 alignedB = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i *>(y)));
+    return Ps2VuNormalize(_mm_add_ps(alignedA, alignedB));
+}
+
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) Ps2VuNormalize(_mm_add_ps((__m128)(a), (__m128)(b)))
-#define PS2_VSUB(a, b) Ps2VuNormalize(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VADD(a, b) Ps2VuAdd((__m128)(a), (__m128)(b))
+#define PS2_VSUB(a, b) Ps2VuAdd((__m128)(a), _mm_xor_ps((__m128)(b), _mm_set1_ps(-0.0f)))
 #define PS2_VMUL(a, b) Ps2VuNormalize(_mm_mul_ps((__m128)(a), (__m128)(b)))
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
