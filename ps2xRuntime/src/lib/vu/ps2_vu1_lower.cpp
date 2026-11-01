@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#include "ps2_runtime_macros.h"
 
 #include <cmath>
 #include <cstring>
@@ -10,59 +11,102 @@
 
 namespace
 {
-    float vuEatan(float value)
-    {
-        constexpr float coefficients[] = {
-            0.999999344348907f,
-            -0.333298563957214f,
-            0.199465364217758f,
-            -0.139085337519646f,
-            0.096420042216778f,
-            -0.055909886956215f,
-            0.021861229091883f,
-            -0.004054057877511f};
-        constexpr float quarterPi = 0.785398185253143f;
+    constexpr uint32_t kEfuOne = 0x3F800000u;
 
-        const float squared = value * value;
-        float polynomial = coefficients[7];
-        for (int index = 6; index >= 0; --index)
-            polynomial = coefficients[index] + squared * polynomial;
-        return quarterPi + value * polynomial;
+    uint32_t bitsOf(float value)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
     }
 
-    float vuEsin(float value)
+    float floatOf(uint32_t bits)
     {
-        constexpr float coefficients[] = {
-            1.0f,
-            -0.166666567325592f,
-            0.008333025500178f,
-            -0.000198074136279f,
-            0.000002601886990f};
-
-        const float squared = value * value;
-        float polynomial = coefficients[4];
-        for (int index = 3; index >= 0; --index)
-            polynomial = coefficients[index] + squared * polynomial;
-        return value * polynomial;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
     }
 
-    float vuEexp(float value)
+    uint32_t efuMul(uint32_t a, uint32_t b) { return bitsOf(Ps2FpuMulSoft(a, b)); }
+    uint32_t efuAdd(uint32_t a, uint32_t b)
     {
-        constexpr float coefficients[] = {
-            0.249998688697815f,
-            0.031257584691048f,
-            0.002591371303424f,
-            0.000171562001924f,
-            0.000005430199963f,
-            0.000000690600018f};
+        const int difference = static_cast<int>((a >> 23) & 0xFFu) - static_cast<int>((b >> 23) & 0xFFu);
+        if (difference > 0)
+            b = Ps2FpuDropBitsBelowGuard(b, difference);
+        else
+            a = Ps2FpuDropBitsBelowGuard(a, -difference);
+        return bitsOf(Ps2FpuAddWide(a, b));
+    }
+    uint32_t efuSub(uint32_t a, uint32_t b) { return efuAdd(a, b ^ 0x80000000u); }
+    uint32_t efuDiv(uint32_t a, uint32_t b) { return bitsOf(Ps2FpuDivExact(floatOf(a), floatOf(b))); }
+    uint32_t efuSqrt(uint32_t a) { return bitsOf(Ps2FpuSqrtExact(floatOf(a & 0x7FFFFFFFu))); }
 
-        float polynomial = coefficients[5];
-        for (int index = 4; index >= 0; --index)
-            polynomial = coefficients[index] + value * polynomial;
-        polynomial = 1.0f + value * polynomial;
-        polynomial *= polynomial;
-        polynomial *= polynomial;
-        return polynomial != 0.0f ? 1.0f / polynomial : std::numeric_limits<float>::max();
+    // x*x + y*y + z*z (ESADD p.142).
+    uint32_t efuSquareSum(const float *v)
+    {
+        const uint32_t x = bitsOf(v[0]), y = bitsOf(v[1]), z = bitsOf(v[2]);
+        return efuAdd(efuAdd(efuMul(x, x), efuMul(y, y)), efuMul(z, z));
+    }
+
+    // T1*t + T2*t^3 + ... + T8*t^15 + pi/4 (EATAN p.130); pi/4 enters as
+    // 1.0 * pi/4 just before the last term.
+    uint32_t efuAtanSeries(uint32_t t)
+    {
+        static constexpr uint32_t T[8] = {0x3F7FFFF5u, 0xBEAAA61Cu, 0x3E4C40A6u, 0xBE0E6C63u,
+                                          0x3DC577DFu, 0xBD6501C4u, 0x3CB31652u, 0xBB84D7E7u};
+        const uint32_t t2 = efuMul(t, t);
+        uint32_t power = t;
+        uint32_t sum = efuMul(T[0], t);
+        uint32_t last = 0u;
+        for (int k = 1; k < 8; ++k)
+        {
+            power = efuMul(power, t2);
+            const uint32_t term = efuMul(power, T[k]);
+            if (k < 7)
+                sum = efuAdd(sum, term);
+            else
+                last = term;
+        }
+        sum = efuAdd(sum, efuMul(kEfuOne, 0x3F490FDBu));
+        return efuAdd(sum, last);
+    }
+
+    // x + S2*x^3 + S3*x^5 + S4*x^7 + S5*x^9 (ESIN p.143).
+    uint32_t efuSin(uint32_t x)
+    {
+        static constexpr uint32_t S[5] = {0x3F800000u, 0xBE2AAAA4u, 0x3C08873Eu, 0xB94FB21Fu, 0x362E9C14u};
+        const uint32_t x2 = efuMul(x, x);
+        uint32_t power = x;
+        uint32_t sum = x;
+        for (int k = 1; k < 5; ++k)
+        {
+            power = efuMul(power, x2);
+            sum = efuAdd(sum, efuMul(power, S[k]));
+        }
+        return sum;
+    }
+
+    // 1 / (1 + E1*x + ... + E6*x^6)^4 = exp(-x) (EEXP p.136); 1.0 enters
+    // just before the last term.
+    uint32_t efuExp(uint32_t x)
+    {
+        static constexpr uint32_t E[6] = {0x3E7FFFA8u, 0x3D0007F4u, 0x3B29D3FFu,
+                                          0x3933E553u, 0x36B63510u, 0x353961ACu};
+        uint32_t power = x;
+        uint32_t sum = efuMul(E[0], x);
+        uint32_t last = 0u;
+        for (int k = 1; k < 6; ++k)
+        {
+            power = efuMul(power, x);
+            const uint32_t term = efuMul(power, E[k]);
+            if (k < 5)
+                sum = efuAdd(sum, term);
+            else
+                last = term;
+        }
+        sum = efuAdd(efuAdd(sum, efuMul(kEfuOne, kEfuOne)), last);
+        const uint32_t squared = efuMul(sum, sum);
+        return efuDiv(kEfuOne, efuMul(squared, squared));
     }
 }
 
@@ -670,104 +714,56 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
                 return;
             case 0x70: // ESADD
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(x * x + y * y + z * z, 11u);
+                queueP(floatOf(efuSquareSum(m_state.vf[vfS])), 11u);
                 return;
-            }
             case 0x71: // ERSADD
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                const float sum = x * x + y * y + z * z;
-                queueP(1.0f / sum, 18u);
+                queueP(floatOf(efuDiv(kEfuOne, efuSquareSum(m_state.vf[vfS]))), 18u);
                 return;
-            }
             case 0x72: // ELENG
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(std::sqrt(x * x + y * y + z * z), 18u);
+                queueP(floatOf(efuSqrt(efuSquareSum(m_state.vf[vfS]))), 18u);
                 return;
-            }
             case 0x73: // ERLENG
+                queueP(floatOf(efuDiv(kEfuOne, efuSqrt(efuSquareSum(m_state.vf[vfS])))), 24u);
+                return;
+            case 0x74: // EATANxy: t = (y-x)/(y+x), no zero check (EATANxy p.132)
+            case 0x75: // EATANxz: t = (z-x)/(z+x) (EATANxz p.134)
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                const float len = std::sqrt(x * x + y * y + z * z);
-                queueP(1.0f / len, 24u);
+                const uint32_t x = bitsOf(m_state.vf[vfS][0]);
+                const uint32_t y = bitsOf(m_state.vf[vfS][funct2 == 0x74 ? 1 : 2]);
+                queueP(floatOf(efuAtanSeries(efuDiv(efuSub(y, x), efuAdd(y, x)))), 54u);
                 return;
             }
-            case 0x74: // EATANxy: t = (y-x)/(y+x), no zero check (p.132)
+            case 0x76: // ESUM, added in order (p.145)
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                queueP(vuEatan((y - x) / (y + x)), 54u);
+                const float *v = m_state.vf[vfS];
+                queueP(floatOf(efuAdd(efuAdd(efuAdd(bitsOf(v[0]), bitsOf(v[1])), bitsOf(v[2])), bitsOf(v[3]))), 12u);
                 return;
             }
-            case 0x75: // EATANxz: t = (z-x)/(z+x) (p.134)
-            {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(vuEatan((z - x) / (z + x)), 54u);
+            // EFU selectors (bits 10..6 << 2 | bits 1..0): ERSQRT 0x79 (p.141), ESIN 0x7C (p.143),
+            // EATAN 0x7D (p.130), EEXP 0x7E (p.136) in the VU User's Manual.
+            case 0x79: // ERSQRT
+                queueP(floatOf(efuDiv(kEfuOne, efuSqrt(bitsOf(m_state.vf[vfS][(instr >> 21) & 3u])))), 18u);
                 return;
-            }
-            case 0x76: // ESUM
-            {
-                float sum = 0.0f;
-                for (uint32_t component = 0; component < 4u; ++component)
-                    sum += normalizeOperand(m_state.vf[vfS][component]);
-                queueP(sum, 12u);
+            case 0x78: // ESQRT
+                queueP(floatOf(efuSqrt(bitsOf(m_state.vf[vfS][(instr >> 21) & 3u]))), 12u);
                 return;
-            }
-            case 0x79: // ERSQRT (p.141), operand sign ignored (real PS2: ps2autotests vu/lower/efu)
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(1.0f / std::sqrt(std::fabs(value)), 18u);
+            case 0x7C: // ESIN
+                queueP(floatOf(efuSin(bitsOf(m_state.vf[vfS][(instr >> 21) & 3u]))), 29u);
                 return;
-            }
-            case 0x78: // ESQRT, operand sign ignored (real PS2)
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(std::sqrt(std::fabs(value)), 12u);
-                return;
-            }
-            case 0x7C: // ESIN (p.143)
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(vuEsin(value), 29u);
-                return;
-            }
             case 0x7A: // ERCPR
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(1.0f / value, 12u);
+                queueP(floatOf(efuDiv(kEfuOne, bitsOf(m_state.vf[vfS][(instr >> 21) & 3u]))), 12u);
                 return;
-            }
             case 0x7B: // WAITP
                 return;
             case 0x7D: // EATAN: t = (x-1)/(x+1) (p.130)
             {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(vuEatan((value - 1.0f) / (value + 1.0f)), 54u);
+                const uint32_t x = bitsOf(m_state.vf[vfS][(instr >> 21) & 3u]);
+                queueP(floatOf(efuAtanSeries(efuDiv(efuSub(x, kEfuOne), efuAdd(x, kEfuOne)))), 54u);
                 return;
             }
-            case 0x7E: // EEXP (p.136)
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
+            case 0x7E: // EEXP
+                queueP(floatOf(efuExp(bitsOf(m_state.vf[vfS][(instr >> 21) & 3u]))), 44u);
                 return;
-            }
             default:
                 reportReservedInstruction(false, instr);
                 return;

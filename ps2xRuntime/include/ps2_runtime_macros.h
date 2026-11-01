@@ -873,6 +873,203 @@ static inline bool Ps2FpuGreater(float fs, float ft)
 static inline float Ps2FpuMax(float fs, float ft) { return Ps2FpuGreater(fs, ft) ? fs : ft; }
 static inline float Ps2FpuMin(float fs, float ft) { return Ps2FpuGreater(ft, fs) ? fs : ft; }
 
+static inline double Ps2FpuToWide(uint32_t v)
+{
+    const uint64_t sign = static_cast<uint64_t>(v & PS2_FLOAT_SIGN_MASK) << 32;
+    const uint32_t e = (v >> 23) & 0xFFu;
+    const uint64_t bits = e == 0u ? sign
+                                  : sign | (static_cast<uint64_t>(e - 127u + 1023u) << 52) |
+                                        (static_cast<uint64_t>(v & 0x7FFFFFu) << 29);
+    double out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+static inline float Ps2FpuFromWide(double value, bool nearest)
+{
+    uint64_t d;
+    std::memcpy(&d, &value, sizeof(d));
+    const uint32_t sign = static_cast<uint32_t>(d >> 32) & PS2_FLOAT_SIGN_MASK;
+    const int de = static_cast<int>((d >> 52) & 0x7FFu);
+    uint32_t bits = sign;
+    if (de != 0)
+    {
+        int exponent = de - 1023 + 127;
+        uint64_t mant = (d & 0xFFFFFFFFFFFFFull) | 0x10000000000000ull; // 53 bits
+        if (nearest)
+            mant += 1ull << 28;
+        uint32_t m24 = static_cast<uint32_t>(mant >> 29);
+        if (m24 >> 24)
+        {
+            m24 >>= 1;
+            ++exponent;
+        }
+        if (exponent >= 256)
+            bits = sign | 0x7FFFFFFFu;
+        else if (exponent > 0)
+            bits = sign | (static_cast<uint32_t>(exponent) << 23) | (m24 & 0x7FFFFFu);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+static inline float Ps2FpuAddWide(uint32_t a, uint32_t b)
+{
+    return Ps2FpuFromWide(Ps2FpuToWide(a) + Ps2FpuToWide(b), false);
+}
+
+static inline void Ps2FpuBooth(uint32_t a, uint32_t b, uint32_t bit, uint32_t &data, uint32_t &negate)
+{
+    const uint32_t test = (bit ? b >> (bit * 2 - 1) : b << 1) & 7u;
+    a <<= (bit * 2);
+    a += (test == 3u || test == 4u) ? a : 0u;
+    const uint32_t neg = (test >= 4u && test <= 6u) ? ~0u : 0u;
+    const uint32_t pos = 1u << (bit * 2);
+    a ^= (neg & (0u - pos));
+    a &= (test >= 1u && test <= 6u) ? ~0u : 0u;
+    data = a;
+    negate = neg & pos;
+}
+static inline uint64_t Ps2FpuMulMantissa(uint32_t a, uint32_t b)
+{
+    const uint64_t full = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+    uint32_t d[8], n[8];
+    for (uint32_t i = 0; i < 8u; ++i)
+        Ps2FpuBooth(a, b, i, d[i], n[i]);
+    auto add3 = [](uint32_t x, uint32_t y, uint32_t z, uint32_t &lo, uint32_t &hi)
+    {
+        const uint32_t u = x ^ y;
+        lo = u ^ z;
+        hi = ((u & z) | (x & y)) << 1;
+    };
+    uint32_t t0l, t0h, t1l, t1h, t2l, t2h, t3l, t3h, t4l, t4h, t5l, t5h;
+    add3(d[1], d[2], d[3], t0l, t0h);
+    add3(d[4] & ~0x7FFu, d[5] & ~0xFFFu, d[6], t1l, t1h);
+    t1h |= n[6] | (d[5] & 0x800u);
+    d[7] |= (d[5] & 0x400u) + n[5];
+    add3(d[0], t0l, t0h, t2l, t2h);
+    add3(d[7], t1l, t1h, t3l, t3h);
+    add3(t2h, t3l, t3h, t4l, t4h);
+    add3(t2l, t4l, t4h, t5l, t5h);
+    t5h += n[7];
+    t5l &= ~0x7FFFu;
+    t5h &= ~0x7FFFu;
+    const uint32_t ps2lo = t5l + t5h;
+    return full - ((ps2lo ^ static_cast<uint32_t>(full)) & 0x8000u);
+}
+// MUL.S from the multiplier model above: truncated product, exponent 255 is a normal number, overflow gives +/-0x7FFFFFFF and underflow +/-0.
+static inline float Ps2FpuMulSoft(uint32_t a, uint32_t b)
+{
+    const uint32_t sign = (a ^ b) & PS2_FLOAT_SIGN_MASK;
+    uint32_t bits = sign;
+    if ((a & PS2_FLOAT_EXP_MASK) && (b & PS2_FLOAT_EXP_MASK))
+    {
+        int exponent = static_cast<int>((a >> 23) & 0xFFu) + static_cast<int>((b >> 23) & 0xFFu) - 127;
+        uint32_t m = static_cast<uint32_t>(Ps2FpuMulMantissa((a & 0x7FFFFFu) | 0x800000u, (b & 0x7FFFFFu) | 0x800000u) >> 23);
+        if (m > 0xFFFFFFu)
+        {
+            m >>= 1;
+            ++exponent;
+        }
+        if (exponent > 255)
+            bits = sign | 0x7FFFFFFFu;
+        else if (exponent >= 1)
+            bits = sign | (static_cast<uint32_t>(exponent) << 23) | (m & 0x7FFFFFu);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline void Ps2FpuCsa(uint32_t a, uint32_t b, uint32_t c, uint32_t &sum, uint32_t &carry)
+{
+    const uint32_t u = a ^ b;
+    sum = u ^ c;
+    carry = ((a & b) | (u & c)) << 1;
+}
+static inline int Ps2FpuQuotientSelect(uint32_t sum, uint32_t carry)
+{
+    // The binary point is between bits 24 and 25; bit 23 is or'd in.
+    const uint32_t mask = (1u << 24) - 1u;
+    const int32_t test = static_cast<int32_t>(((sum & ~mask) + carry) | (sum & mask));
+    if (test >= (1 << 23))
+        return 1;
+    if (test < static_cast<int32_t>(~0u << 24))
+        return -1;
+    return 0;
+}
+// DIV.S (p.357): x/0 = +/-0x7FFFFFFF; 0/x = +/-0; overflow gives
+// +/-0x7FFFFFFF and underflow +/-0.
+static inline float Ps2FpuDivExact(float fs, float ft)
+{
+    uint32_t a, b;
+    std::memcpy(&a, &fs, sizeof(a));
+    std::memcpy(&b, &ft, sizeof(b));
+    const uint32_t sign = (a ^ b) & PS2_FLOAT_SIGN_MASK;
+    uint32_t bits = sign;
+    if ((b & PS2_FLOAT_EXP_MASK) == 0u)
+        bits = sign | 0x7FFFFFFFu;
+    else if ((a & PS2_FLOAT_EXP_MASK) != 0u)
+    {
+        const uint32_t bm = ((b & 0x7FFFFFu) | 0x800000u) << 2;
+        uint32_t sum = ((a & 0x7FFFFFu) | 0x800000u) << 2, carry = 0, quotient = 0;
+        int quotientBit = 1;
+        for (int i = 0; i < 25; ++i)
+        {
+            quotient = (quotient << 1) + static_cast<uint32_t>(quotientBit);
+            const uint32_t add = quotientBit > 0 ? ~bm : quotientBit < 0 ? bm : 0u;
+            carry += quotientBit > 0 ? 1u : 0u;
+            uint32_t csaSum, csaCarry;
+            Ps2FpuCsa(sum, carry, add, csaSum, csaCarry);
+            quotientBit = quotientBit ? Ps2FpuQuotientSelect(csaSum, csaCarry) : Ps2FpuQuotientSelect(sum, carry);
+            sum = csaSum << 1;
+            carry = csaCarry << 1;
+        }
+        int exponent = static_cast<int>((a >> 23) & 0xFFu) - static_cast<int>((b >> 23) & 0xFFu) + 126;
+        if (quotient >= (1u << 24))
+        {
+            ++exponent;
+            quotient >>= 1;
+        }
+        if (exponent > 255)
+            bits = sign | 0x7FFFFFFFu;
+        else if (exponent >= 1)
+            bits = sign | (static_cast<uint32_t>(exponent) << 23) | (quotient & 0x7FFFFFu);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+// SQRT.S (p.376) of |ft|; sqrt(+/-0) = +0 (real PS2).
+static inline float Ps2FpuSqrtExact(float ft)
+{
+    uint32_t a;
+    std::memcpy(&a, &ft, sizeof(a));
+    if ((a & PS2_FLOAT_EXP_MASK) == 0u)
+        return 0.0f;
+    uint32_t sum = ((a & 0x7FFFFFu) | 0x800000u) << 1, carry = 0, quotient = 0;
+    if (!(a & 0x800000u)) // odd exponent after removing the bias
+        sum <<= 1;
+    int quotientBit = 1;
+    for (int i = 0; i < 25; ++i)
+    {
+        // Adding n to the root adds n * (2 * root + n) to its square.
+        const uint32_t adjust = quotient + (static_cast<uint32_t>(quotientBit) << (24 - i));
+        quotient += static_cast<uint32_t>(quotientBit) << (25 - i);
+        const uint32_t add = quotientBit > 0 ? ~adjust : quotientBit < 0 ? adjust : 0u;
+        carry += quotientBit > 0 ? 1u : 0u;
+        uint32_t csaSum, csaCarry;
+        Ps2FpuCsa(sum, carry, add, csaSum, csaCarry);
+        quotientBit = quotientBit ? Ps2FpuQuotientSelect(csaSum, csaCarry) : Ps2FpuQuotientSelect(sum, carry);
+        sum = csaSum << 1;
+        carry = csaCarry << 1;
+    }
+    const uint32_t exponent = (((a >> 23) & 0xFFu) + 127u) >> 1;
+    const uint32_t bits = ((quotient >> 2) & 0x7FFFFFu) | (exponent << 23);
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
 #define FPU_ADD_S(a, b) Ps2FpuAdd((float)(a), (float)(b))
 #define FPU_SUB_S(a, b) Ps2FpuAdd((float)(a), -(float)(b))

@@ -645,8 +645,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
 
 void VU1Interpreter::queueP(float value, uint32_t latency)
 {
-    uint32_t ignoredFlags = 0u;
-    value = normalizeResult(value, ignoredFlags);
+    // EFU results already follow the PS2 rules and keep exponent 255 (ps2_vu1_lower.cpp efu*).
     const uint32_t free = ((1u << m_efu.size()) - 1u) & ~uint32_t(m_efuPending);
     if (free)
     {
