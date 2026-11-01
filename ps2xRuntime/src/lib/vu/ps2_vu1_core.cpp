@@ -1489,12 +1489,12 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
     case 0x74:
     case 0x75:
     case 0x76:
-    case 0x77:
     case 0x78:
     case 0x79:
     case 0x7A:
     case 0x7C:
     case 0x7D:
+    case 0x7E:
         if (m_unit == Unit::VU0)
         {
             usage.reserved = true;
@@ -1508,7 +1508,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
             break;
         case 0x71:
         case 0x72:
-        case 0x77:
+        case 0x79: // ERSQRT
             usage.latency = 18u;
             break;
         case 0x73:
@@ -1516,7 +1516,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
             break;
         case 0x74:
         case 0x75:
-        case 0x7C:
+        case 0x7D: // EATAN
             usage.latency = 54u;
             break;
         case 0x76:
@@ -1524,10 +1524,10 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
         case 0x7A:
             usage.latency = 12u;
             break;
-        case 0x79:
+        case 0x7C: // ESIN
             usage.latency = 29u;
             break;
-        case 0x7D:
+        case 0x7E: // EEXP
             usage.latency = 44u;
             break;
         default:
