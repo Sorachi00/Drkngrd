@@ -23,8 +23,12 @@
 
 class GS;
 
-constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
-constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
+
+//Adding more RAM for mods (like far enemies)
+constexpr uint32_t PS2_RAM_SIZE = 128u * 1024u * 1024u;
+constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;
+constexpr uint32_t PS2_GUEST_RAM_SIZE = 32u * 1024u * 1024u;
+constexpr uint32_t PS2_EXTRA_RAM_BASE = PS2_GUEST_RAM_SIZE;
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
