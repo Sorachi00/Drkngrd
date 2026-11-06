@@ -5,10 +5,33 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
 #include <vector>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace
+{
+    // Zeroed pages from the OS: a page uses physical memory only after its first access.
+    uint8_t *allocateRdram(size_t size)
+    {
+        return static_cast<uint8_t *>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
+
+    void freeRdram(uint8_t *p)
+    {
+        if (p)
+            VirtualFree(p, 0, MEM_RELEASE);
+    }
+}
 
 namespace
 {
@@ -246,11 +269,8 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
-    if (m_rdram)
-    {
-        delete[] m_rdram;
-        m_rdram = nullptr;
-    }
+    freeRdram(m_rdram);
+    m_rdram = nullptr;
 
     if (m_scratchpad)
     {
@@ -297,7 +317,7 @@ bool PS2Memory::initialize(size_t ramSize)
 {
     auto cleanup = [this]()
     {
-        delete[] m_rdram;
+        freeRdram(m_rdram);
         delete[] m_scratchpad;
         delete[] iop_ram;
         delete[] m_gsVRAM;
@@ -340,8 +360,9 @@ bool PS2Memory::initialize(size_t ramSize)
     try
     {
         // Allocate main RAM
-        m_rdram = new uint8_t[ramSize];
-        std::memset(m_rdram, 0, ramSize);
+        m_rdram = allocateRdram(ramSize);
+        if (!m_rdram)
+            throw std::bad_alloc();
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
