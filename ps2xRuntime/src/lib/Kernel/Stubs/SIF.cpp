@@ -62,7 +62,7 @@ namespace ps2_stubs
         std::unordered_map<uint32_t, uint32_t> g_sifSregs;
         std::unordered_map<uint32_t, uint32_t> g_sifCmdHandlers;
         std::map<uint32_t, uint32_t> g_sifHeapAllocations;
-        std::array<uint8_t, kIopHeapLimit - kIopHeapBase> g_sifHeapStorage{};
+        std::array<uint8_t, kIopHeapHighLimit - kIopHeapHighBase> g_sifHeapStorage{};
         uint32_t g_sifCmdBuffer = 0u;
         uint32_t g_sifSysCmdBuffer = 0u;
         bool g_sifCmdInitialized = false;
@@ -141,7 +141,7 @@ namespace ps2_stubs
             }
 
             std::lock_guard<std::mutex> lock(g_sifHeapMutex);
-            uint32_t candidate = kIopHeapBase;
+            uint32_t candidate = g_iopHeapBase;
             for (const auto &[addr, size] : g_sifHeapAllocations)
             {
                 if (candidate + alignedSize <= addr)
@@ -156,13 +156,13 @@ namespace ps2_stubs
                 }
             }
 
-            if (candidate < kIopHeapBase || candidate + alignedSize > kIopHeapLimit)
+            if (candidate < g_iopHeapBase || candidate + alignedSize > g_iopHeapLimit)
             {
                 return 0u;
             }
 
             g_sifHeapAllocations[candidate] = alignedSize;
-            std::fill_n(g_sifHeapStorage.data() + (candidate - kIopHeapBase),
+            std::fill_n(g_sifHeapStorage.data() + (candidate - g_iopHeapBase),
                         alignedSize,
                         uint8_t{0});
             g_iopHeapNext = candidate + alignedSize;
@@ -181,7 +181,7 @@ namespace ps2_stubs
             g_sifHeapAllocations.erase(it);
             if (g_sifHeapAllocations.empty())
             {
-                g_iopHeapNext = kIopHeapBase;
+                g_iopHeapNext = g_iopHeapBase;
             }
             return true;
         }
@@ -191,12 +191,12 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_sifHeapMutex);
             g_sifHeapAllocations.clear();
             g_sifHeapStorage.fill(0u);
-            g_iopHeapNext = kIopHeapBase;
+            g_iopHeapNext = g_iopHeapBase ;
         }
 
         bool isAllocatedSifHeapRangeLocked(uint32_t address, size_t size)
         {
-            if (address < kIopHeapBase || address >= kIopHeapLimit || size > static_cast<size_t>(kIopHeapLimit - address))
+            if (address < g_iopHeapBase || address >= g_iopHeapLimit || size > static_cast<size_t>(g_iopHeapLimit - address))
             {
                 return false;
             }
@@ -366,7 +366,7 @@ namespace ps2_stubs
 
     bool isSifIopHeapAddress(uint32_t address)
     {
-        return address >= kIopHeapBase && address < kIopHeapLimit;
+        return address >= g_iopHeapBase && address < g_iopHeapLimit;
     }
 
     bool isSifIopHeapRange(uint32_t address, size_t size)
@@ -389,10 +389,20 @@ namespace ps2_stubs
         if (size != 0u)
         {
             std::memcpy(destination,
-                        g_sifHeapStorage.data() + (address - kIopHeapBase),
+                        g_sifHeapStorage.data() + (address - g_iopHeapBase),
                         size);
         }
         return true;
+    }
+
+    uint8_t *sifIopHeapPointer(uint32_t address, size_t size)
+    {
+        std::lock_guard<std::mutex> lock(g_sifHeapMutex);
+        if (!isAllocatedSifHeapRangeLocked(address, size))
+        {
+            return nullptr;
+        }
+        return g_sifHeapStorage.data() + (address - g_iopHeapBase) ;
     }
 
     bool writeSifIopHeap(uint32_t address, const void *source, size_t size)
@@ -408,7 +418,7 @@ namespace ps2_stubs
         }
         if (size != 0u)
         {
-            std::memcpy(g_sifHeapStorage.data() + (address - kIopHeapBase),
+            std::memcpy(g_sifHeapStorage.data() + (address - g_iopHeapBase),
                         source,
                         size);
         }
@@ -424,9 +434,18 @@ namespace ps2_stubs
         }
         if (size != 0u)
         {
-            std::memset(g_sifHeapStorage.data() + (address - kIopHeapBase), 0, size);
+            std::memset(g_sifHeapStorage.data() + (address - g_iopHeapBase), 0, size);
         }
         return true;
+    }
+
+    void selectSifIopHeap(uint32_t lowestWritableElfAddress)
+    {
+        const bool low = lowestWritableElfAddress >= kIopHeapLowLimit;
+        g_iopHeapBase = low ? kIopHeapLowBase : kIopHeapHighBase;
+        g_iopHeapLimit = low ? kIopHeapLowLimit : kIopHeapHighLimit;
+
+        resetSifHeapState();  
     }
 
     void resetSifState()

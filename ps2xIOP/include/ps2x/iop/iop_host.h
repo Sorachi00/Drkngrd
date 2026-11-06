@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/iop/spu2_device.h"
 
 #include <array>
 #include <cstddef>
@@ -67,6 +68,11 @@ namespace ps2x::iop
         virtual void freeGuest(uint32_t address) = 0;
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
+
+        virtual Spu2Device *spu2()
+         {
+            return nullptr;
+        }
 
         virtual std::string hostPath(HostPathKind kind) const = 0;
         virtual std::string translateGuestPath(std::string_view path) const = 0;

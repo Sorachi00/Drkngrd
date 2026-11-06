@@ -13,6 +13,8 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
+#include "runtime/ps2_audio_engine.h"
+#include "Kernel/Stubs/SIF.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -508,6 +510,7 @@ PS2Runtime::~PS2Runtime()
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
 #else
+        PS2AudioEngine::instance().stop();
         if (IsAudioDeviceReady())
         {
             CloseAudioDevice();
@@ -672,6 +675,16 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        PS2AudioEngine::instance().start([](uint32_t address, uint32_t size) -> uint8_t * 
+                                         {
+            if (ps2_stubs::isSifIopHeapAddress(address))
+                return ps2_stubs::sifIopHeapPointer(address, size);
+            static std::atomic<bool> s_logged{false};
+            if (!s_logged.exchange(true, std::memory_order_relaxed))
+                std::cerr << "[spu2] IOP address 0x" << std::hex << address << " size 0x" << size << std::dec
+                          << " is outside the SIF IOP heap; transfer ignored (logged once)" << std::endl;
+            return nullptr; },
+                                         IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -761,6 +774,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
     uint32_t moduleEnd = 0u;
     bool loadedAnySegment = false;
+    uint32_t lowestWritableAddress = PS2_GUEST_RAM_SIZE;
 
     for (uint16_t i = 0; i < header.phnum; i++)
     {
@@ -870,6 +884,11 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
             }
         }
 
+        if ((ph.flags & 0x2u) != 0u && !scratch) // PF_W
+        {
+            lowestWritableAddress = std::min(lowestWritableAddress, physAddr);
+        }
+
         loadedAnySegment = true;
         moduleBase = std::min(moduleBase, ph.vaddr);
         const uint64_t segmentVirtualEnd = static_cast<uint64_t>(ph.vaddr) + static_cast<uint64_t>(ph.memsz);
@@ -885,6 +904,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::cerr << "ELF contains no loadable PT_LOAD segments." << std::endl;
         return false;
     }
+    ps2_stubs::selectSifIopHeap(lowestWritableAddress);
 
     if (maxLoadedRdramEnd > PS2_GUEST_RAM_SIZE)
     {
@@ -2317,6 +2337,7 @@ void PS2Runtime::run()
     GSPerf::gameFrames.store(0, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
+    PS2AudioEngine::instance().reset();
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetMpegStubState();
     initializeEeKernelState(m_memory.getRDRAM());

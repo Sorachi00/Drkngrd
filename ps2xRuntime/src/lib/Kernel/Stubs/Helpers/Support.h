@@ -29,10 +29,15 @@ namespace
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
 
-    constexpr uint32_t kIopHeapBase = 0x04000000;
-    constexpr uint32_t kIopHeapLimit = 0x04500000;
+    // Default IOP heap: above EE RAM, so no EE address is taken for an IOP one.
+     constexpr uint32_t kIopHeapHighBase = 0x04000000;
+    constexpr uint32_t kIopHeapHighLimit = 0x04500000;
+    constexpr uint32_t kIopHeapLowBase = 0x000A0000;
+    constexpr uint32_t kIopHeapLowLimit = 0x001F0000;
     constexpr uint32_t kIopHeapAlign = 64;
-    uint32_t g_iopHeapNext = kIopHeapBase;
+    uint32_t g_iopHeapBase =  kIopHeapHighBase;
+    uint32_t g_iopHeapLimit = kIopHeapHighLimit;
+    uint32_t g_iopHeapNext = kIopHeapHighBase;
 
     std::string toLowerAscii(std::string value)
     {

@@ -56,6 +56,7 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    ps2x::iop::Spu2Device *spu2() override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;

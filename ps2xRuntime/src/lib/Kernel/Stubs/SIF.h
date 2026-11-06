@@ -9,6 +9,8 @@ namespace ps2_stubs
     bool isSifIopHeapAddress(uint32_t address);
     bool isSifIopHeapRange(uint32_t address, size_t size);
     bool readSifIopHeap(uint32_t address, void *destination, size_t size);
+    uint8_t *sifIopHeapPointer(uint32_t address, size_t size);
+    void selectSifIopHeap(uint32_t lowestWritableElfAddress);
     bool writeSifIopHeap(uint32_t address, const void *source, size_t size);
     bool zeroSifIopHeap(uint32_t address, size_t size);
 

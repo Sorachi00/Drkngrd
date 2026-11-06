@@ -555,6 +555,73 @@ namespace ps2_stubs
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
         };
 
+         struct MpegAudioRetryQueue
+        {
+            struct Identity
+            {
+                uint64_t generation = 0u;
+                uint64_t sequence = 0u ;
+                bool operator==(const Identity &other) const
+                {
+                    return generation == other.generation && sequence == other.sequence;
+                }
+            };
+            struct Item
+            {
+                std::vector<uint8_t> bytes;
+                uint32_t mpegAddr = 0u;
+                uint32_t streamType = 0u;
+                uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+                uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+                std::vector<MpegRegisteredCallback> callbacks;
+                Identity identity;
+            };
+             std::deque<Item> queue;
+            uint64_t generation = 1u;
+            uint64_t nextSequence = 1u;
+            Identity inFlightIdentity;
+            bool inFlight = false;
+            uint32_t waited = 0u;
+            std::shared_ptr<std::atomic<int>> result;   
+        };
+
+        constexpr size_t kMaxQueuedAudioPayloads = 24u;
+        constexpr size_t kAudioPayloadHardCap = 512u;
+        MpegAudioRetryQueue g_mpeg_audio_retry;
+
+        void invalidateMpegAudioRetryQueueUnlocked()
+        {
+            MpegAudioRetryQueue &q =  g_mpeg_audio_retry;
+
+            q.queue.clear();
+            q.inFlight = false ;
+            q.inFlightIdentity = {};
+            q.result.reset();
+            q.waited = 0u;
+            ++q.generation;
+        }
+
+        bool completeMpegAudioRetry(MpegAudioRetryQueue &q, const MpegAudioRetryQueue::Identity &identity, int answer)
+        {
+            if (!q.inFlight || !(q.inFlightIdentity == identity))
+            {
+                return false;
+            }
+            if (answer < 0 && ++q.waited < 4096u)
+            {
+                return false;
+
+            }
+            q.waited = 0u;
+            q.inFlight = false;
+            q.result.reset();
+            if (answer > 0 && !q.queue.empty() && q.queue.front().identity == identity)
+            {
+                q.queue.pop_front();
+            }
+            return true;
+        }
+
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
@@ -1206,6 +1273,32 @@ namespace ps2_stubs
             }
         }
 
+        void enqueueAudioPayload(uint32_t mpegAddr,
+                                 const uint8_t *payload,
+                                 size_t len,  
+                                 int64_t pts90k,
+                                 int64_t dts90k) 
+        {
+            if (!payload || len == 0u || g_mpeg_audio_retry.queue.size() >= kAudioPayloadHardCap)   
+            {
+                return;
+            }
+            MpegAudioRetryQueue::Item item;
+            item.bytes.assign(payload, payload + len);
+            item.mpegAddr = mpegAddr ;
+             item.streamType = kMpegStrPCM;
+            item.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
+            item.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
+            item.callbacks = matchingStreamCallbacks(mpegAddr, kMpegStrPCM);
+            if (item.callbacks.empty())
+            {
+                item.streamType = kMpegStrADPCM; 
+                item.callbacks = matchingStreamCallbacks(mpegAddr, kMpegStrADPCM);
+            }
+            item.identity = {g_mpeg_audio_retry.generation, g_mpeg_audio_retry.nextSequence++};
+            g_mpeg_audio_retry.queue.push_back(std::move(item));
+        }
+
         void processPssBuffer(uint32_t mpegAddr,
                               MpegPlaybackState &playback,
                               std::vector<MpegStreamCallbackEvent> &callbackEvents,
@@ -1379,22 +1472,11 @@ namespace ps2_stubs
                     const size_t payloadStart = pes.payloadOffset;
                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
                     {
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
+                         enqueueAudioPayload(mpegAddr,
+                                            buffer.data() + payloadStart,
+                                            packetEnd - payloadStart,
+                                            pes.pts90k,
+                                            pes.dts90k);
                     }
                 }
 
@@ -1432,6 +1514,12 @@ namespace ps2_stubs
         {
             // Drakengard primes until demux refuses, then retries in its update
             // loop. A decoded-frame limit stalls priming after just 8 pictures.
+            // Audio payloads the game has not taken yet also hold the demux.
+            if (g_mpeg_audio_retry.queue.size() >= kMaxQueuedAudioPayloads &&
+                !g_mpeg_stub_state.currentCdStreamEofSeen)
+            {
+                return true;
+            }
             return playback.pendingVideoEsBytes >= 2u * 1024u * 1024u;
         }
 
@@ -1690,6 +1778,142 @@ namespace ps2_stubs
             dispatchStreamCallbacks(rdram, ctx, runtime, events);
         }
 
+        void pumpAudioRetryQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (!rdram || !ctx || !runtime)
+            {
+                return;
+            }
+
+            MpegAudioRetryQueue::Item item;
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegAudioRetryQueue &q = g_mpeg_audio_retry;
+                if (q.inFlight)
+                {
+                    const int answer = q.result ? q.result->load(std::memory_order_acquire) : 1;
+                    if(!completeMpegAudioRetry(q, q.inFlightIdentity, answer))
+                    {
+                        return; // the callback has not answered yet
+                    }
+                }
+                while (!q.queue.empty() && q.queue.front().identity.generation != q.generation)   
+
+                {
+                    q.queue.pop_front();   
+                }  
+                if (q.queue.empty())
+                {
+                    return;
+                }
+                item = q.queue.front() ;
+                if (item.callbacks.empty())
+                {
+                    item.streamType = kMpegStrPCM;
+                     item.callbacks = matchingStreamCallbacks(item.mpegAddr, kMpegStrPCM);
+
+                    if (item.callbacks.empty())
+                    {
+                        item.streamType = kMpegStrADPCM;
+                        item.callbacks = matchingStreamCallbacks(item.mpegAddr, kMpegStrADPCM);
+
+                    }
+                    if (item.callbacks.empty())
+                    {
+                        return;
+                    }
+                    q.queue.front().callbacks = item.callbacks;
+                    q.queue.front().streamType = item.streamType;
+                }
+            }
+
+            const uint32_t dataAddr = runtime->guestMalloc(static_cast<uint32_t>(item.bytes.size()), 16u);
+            uint8_t *dst = dataAddr != 0u ? getMemPtr(rdram, dataAddr) : nullptr;
+            if (!dst)
+            {
+                if (dataAddr != 0u)
+                {
+                    runtime->guestFree(dataAddr);
+                }
+                return;
+            }   
+            std::memcpy(dst, item.bytes.data(), item.bytes.size());
+
+            MpegStreamCallbackEvent event{};
+            event.mpegAddr = item.mpegAddr;   
+            event.streamType = item.streamType;
+            event.dataAddr = dataAddr;
+            event.len = static_cast<uint32_t>(item.bytes.size());
+            event.pts = item.pts;
+            event.dts = item.dts;
+
+            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            if (cbDataAddr == 0u || !writeMpegCallbackData(rdram, cbDataAddr, event))
+            {
+                if (cbDataAddr != 0u)
+                {
+                    runtime->guestFree(cbDataAddr);
+                }
+                runtime->guestFree(dataAddr);
+                return;   
+            }
+
+             const MpegRegisteredCallback &callback = item.callbacks.front();
+            if (callback.func == 0u || !runtime->hasFunction(callback.func))
+             {
+
+                runtime->guestFree(cbDataAddr);
+                runtime->guestFree(dataAddr) ;
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                if (!g_mpeg_audio_retry.queue.empty() && g_mpeg_audio_retry.queue.front().identity == item.identity)
+
+                {
+                    g_mpeg_audio_retry.queue.pop_front();
+                }
+                return;
+            }
+
+            auto answer = std::make_shared<std::atomic<int>>(-1);
+            R5900Context callbackCtx = *ctx;
+            SET_GPR_U32(&callbackCtx, 4, item.mpegAddr);
+
+            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
+            SET_GPR_U32(&callbackCtx, 6, callback.data);
+            SET_GPR_U32(&callbackCtx, 7, 0u);
+
+            SET_GPR_U32(&callbackCtx, 29, 0u);
+            SET_GPR_U32(&callbackCtx, 31, 0u);
+            callbackCtx.pc = callback.func;
+
+            GuestInvocation invocation{};
+
+            invocation.kind = GuestInvocationKind::RpcCallback;
+
+            invocation.context = callbackCtx;
+            invocation.onComplete = [runtime, cbDataAddr, dataAddr, answer](const R5900Context &finished, R5900Context &)
+            {
+                 answer->store(static_cast<int>(getRegU32(&finished, 2)), std::memory_order_release);
+                runtime->guestFree(cbDataAddr);
+                runtime->guestFree(dataAddr);
+            };
+
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                 if (g_mpeg_audio_retry.queue.empty() ||
+                    !(g_mpeg_audio_retry.queue.front().identity == item.identity) ||
+                    g_mpeg_audio_retry.inFlight)
+                {
+                    runtime->guestFree(cbDataAddr);
+                    runtime->guestFree(dataAddr);
+                    return;
+                }
+                g_mpeg_audio_retry.result = answer;
+                g_mpeg_audio_retry.inFlight = true;
+                g_mpeg_audio_retry.inFlightIdentity = item.identity;
+            } 
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+        }
+
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
         {
             if (!rdram || destAddr == 0u)
@@ -1782,6 +2006,7 @@ namespace ps2_stubs
 
         void resetMpegStubStateUnlocked()
         {
+            invalidateMpegAudioRetryQueueUnlocked();
             g_mpeg_stub_state.initialized = false;
             g_mpeg_stub_state.nextCallbackHandle = 1u;
             g_mpeg_stub_state.cdStreamGeneration = 0u;
@@ -1826,6 +2051,7 @@ namespace ps2_stubs
     {
         (void)runtime;
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+         invalidateMpegAudioRetryQueueUnlocked();
         ++g_mpeg_stub_state.cdStreamGeneration;
         g_mpeg_stub_state.cdStreamBytesProduced = 0u;
         g_mpeg_stub_state.cdStreamBytesDemuxed = 0u;
@@ -2045,6 +2271,7 @@ namespace ps2_stubs
 
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            invalidateMpegAudioRetryQueueUnlocked();
             getPlaybackState(param_1) = makeFreshPlaybackState();
         }
 
@@ -2105,6 +2332,7 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            invalidateMpegAudioRetryQueueUnlocked();
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
@@ -2181,6 +2409,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        pumpAudioRetryQueue(rdram, ctx, runtime);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
@@ -2277,6 +2506,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        pumpAudioRetryQueue(rdram, ctx, runtime);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
@@ -2461,6 +2691,8 @@ namespace ps2_stubs
             writeBlankMpegFrame(rdram, imageAddr, width, height);
         }
 
+        pumpAudioRetryQueue(rdram, ctx, runtime);   
+
         setReturnS32(ctx, 0);
     }
 
@@ -2553,6 +2785,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);
+            invalidateMpegAudioRetryQueueUnlocked();
             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
             if (playback.streamEnded || playback.decoderFailed)
             {

@@ -1,4 +1,5 @@
 #include "ps2_iop_host.h"
+#include "runtime/ps2_audio_engine.h"
 
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -278,12 +279,18 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
     {
         receivePointer = nullptr;
     }
-    m_runtime.audioBackend().onSoundCommand(sid,
-                                            function,
-                                            sendPointer,
-                                            send.size,
-                                            receivePointer,
-                                            receive.size);
+
+    PS2AudioEngine::instance().onSoundCommand(sid,
+                                              function,
+                                              sendPointer,
+                                              send.size,
+                                              receivePointer,
+                                              receive.size);
+}
+
+ps2x::iop::Spu2Device *PS2IopHostAdapter::spu2()
+{
+    return &PS2AudioEngine::instance().spu2();
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
