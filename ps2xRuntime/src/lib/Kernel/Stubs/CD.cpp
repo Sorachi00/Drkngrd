@@ -2,6 +2,7 @@
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_native_movie.h"
 #include "ps2x/iop/iop_types.h"
 
 namespace ps2_stubs
@@ -920,6 +921,22 @@ namespace ps2_stubs
         g_cdStReadTraceCount = 0u;
 
         notifyMpegCdStreamStart(runtime);
+
+        PS2NativeMovie::stop();
+         if (PS2NativeMovie::enabled())
+        {
+            for (const auto &[key, entry] : g_cdFilesByKey)
+            {
+                if (lbn < entry.baseLbn || lbn >= entry.baseLbn + entry.sectors)
+                     continue;
+                std::string name = entry.hostPath.filename().string();
+                std::transform(name.begin(), name.end(), name.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+                if (name.rfind("MOVIE", 0) == 0)
+                    PS2NativeMovie::start(entry.hostPath, static_cast<uint64_t>(lbn - entry.baseLbn) * kCdSectorSize);
+                 break;
+            }
+        }   
 
         std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
                   << " endLbn=0x" << g_cdStreamingEndLbn << std::dec

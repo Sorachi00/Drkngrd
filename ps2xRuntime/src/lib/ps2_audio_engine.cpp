@@ -1,4 +1,6 @@
 #include "runtime/ps2_audio_engine.h"
+
+#include "runtime/ps2_native_movie.h"
 #include "ps2_host_backend.h"
 
 #include <algorithm>
@@ -146,6 +148,7 @@ struct PS2AudioEngine::Impl
     PS2Spu2::GuestResolver resolver;
     std::mutex outputMutex; // dump
     WavDump dump; 
+    std::vector<int16_t> renderMovie; 
 };
 
 PS2AudioEngine &PS2AudioEngine::instance()
@@ -227,7 +230,10 @@ void PS2AudioEngine::reset()
 void PS2AudioEngine::render(int16_t *pcm, uint32_t frames)
 {
     Impl *impl = m_impl.get();
-    m_spu2.mix(pcm, frames);
+    std::vector<int16_t> &movie = impl->renderMovie;
+    movie.resize(static_cast<size_t>(frames) * 2u);
+    const bool moviePlaying = PS2NativeMovie::readAudio(movie.data(), frames);
+    m_spu2.mix(pcm, frames, moviePlaying ? movie.data() : nullptr);
     {
         std::lock_guard<std::mutex> lock(impl->outputMutex);
         impl->dump.write(pcm, frames);

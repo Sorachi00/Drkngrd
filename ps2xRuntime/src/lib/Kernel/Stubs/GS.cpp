@@ -5,6 +5,7 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_video_timing.h"
+#include "runtime/ps2_native_movie.h"
 
 namespace ps2_stubs
 {
@@ -1265,6 +1266,19 @@ namespace ps2_stubs
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // The movie player polls field parity even in non-interlaced mode.
+        static uint64_t s_movieFieldTick = 0u;
+        if (PS2NativeMovie::active())
+        {
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            if ((tick & 1u) != 0u && tick > s_movieFieldTick)
+             {
+                s_movieFieldTick = tick;
+                setReturnS32(ctx, 0);
+                return;
+            }   
+
+            s_movieFieldTick = tick + 1u ;
+         }
         ps2_syscalls::WaitVSyncTick(rdram, ctx, runtime, -1);
     }
 

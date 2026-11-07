@@ -2,6 +2,7 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_video_timing.h"
+#include "runtime/ps2_native_movie.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -1169,6 +1170,13 @@ namespace ps2_stubs
                 playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             }
 
+            // The native player (ps2_native_movie.h) decodes this movie itself.
+            if (PS2NativeMovie::active())
+            {
+                playback.videoSequenceSyncBuffer.clear();
+                return;
+            }
+
             if (!playback.decoder)
             {
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
@@ -1285,6 +1293,17 @@ namespace ps2_stubs
             }
             MpegAudioRetryQueue::Item item;
             item.bytes.assign(payload, payload + len);
+            if (PS2NativeMovie::active())   
+            {
+                size_t keep = std::min<size_t>(4u, len);
+                if (len >= 12u && std::memcmp(payload + 4, "SShd", 4) == 0)
+                {
+                    uint32_t headerSize = 0;
+                    std::memcpy(&headerSize, payload + 8, 4) ;
+                    keep = std::min<size_t>(len, 4u + 8u + headerSize + 8u);
+                }
+                std::fill(item.bytes.begin() + static_cast<std::ptrdiff_t>(keep), item.bytes.end(), uint8_t(0));   
+            }
             item.mpegAddr = mpegAddr ;
              item.streamType = kMpegStrPCM;
             item.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
@@ -2029,6 +2048,7 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         resetMpegStubStateUnlocked();
+        PS2NativeMovie::stop();
     }
 
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
@@ -2337,6 +2357,7 @@ namespace ps2_stubs
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
         PS2VideoTiming::setMovieActive(false);
+        PS2NativeMovie::stop(); 
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
     }
@@ -2560,12 +2581,16 @@ namespace ps2_stubs
         uint32_t frameCount = 0u;
         bool haveFrame = false;
         MpegDecodedFrame frame;
+        // The native player has a picture for every call: no waits.
+        const bool native = PS2NativeMovie::active();
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             drainPendingVideoEs(playback);
             flushDecoderIfEnded(playback);
-            if (playback.decodedFrames.empty() &&
+            if (!native &&
+
+                playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
                 !playback.decoderFailed)
@@ -2595,7 +2620,7 @@ namespace ps2_stubs
                     });
             }
 
-            if (!playback.decodedFrames.empty())
+            if (!native && !playback.decodedFrames.empty())
             {
                 const uint64_t currentTick = runtime->eeScheduler().currentVSyncTick();
                 const uint64_t currentTickQ32 = currentTick << 32u;
@@ -2665,6 +2690,23 @@ namespace ps2_stubs
             syncGuestMpegWorkArea(rdram, mpegAddr, playback);
         }
 
+        const MpegDecodedFrame *shown = &frame;
+        if (native)
+        {
+            static MpegDecodedFrame nativeFrame; // game thread only; copied when a new one is due
+            static uint64_t nativeSerial = 0;
+            uint32_t index = 0;
+            if (PS2NativeMovie::currentFrame(nativeFrame.rgba, nativeFrame.width, nativeFrame.height, index,
+                                             nativeSerial))
+            {
+                shown = &nativeFrame;
+                haveFrame = true;
+                width = static_cast<uint32_t>(nativeFrame.width);
+                height = static_cast<uint32_t>(nativeFrame.height);
+                frameCount = index;
+            }   
+        }
+
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
         mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
@@ -2684,7 +2726,7 @@ namespace ps2_stubs
 
         if (haveFrame)
         {
-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
+            writeDecodedFrameToGuest(rdram, imageAddr, *shown);
         }
         else if (frameCount == 0u)
         {
@@ -2764,7 +2806,9 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && playback.pendingVideoEs.empty() && presentationComplete) ? 1 : 0);
+        // With the native player the movie ends when its sound and pictures have played.
+        const bool nativePlaying = PS2NativeMovie::active() && !PS2NativeMovie::finished();
+         setReturnS32(ctx, (!nativePlaying && ended && playback.decodedFrames.empty() && playback.pendingVideoEs.empty() && presentationComplete) ? 1 : 0);
     }
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2782,6 +2826,8 @@ namespace ps2_stubs
         (void)runtime;
         const uint32_t param_1 = getRegU32(ctx, 4);
         PS2VideoTiming::setMovieActive(false);
+
+        PS2NativeMovie::stop();
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);
