@@ -73,8 +73,26 @@ else()
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
+    else()
+        # Desktop host: window, input, audio and the picture (ps2_host_sdl3.cpp).
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-3.4.18"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+        set(PS2X_HOST_SDL3 ON)
     endif()
 
+    if(NOT PS2X_HOST_SDL3)
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
@@ -82,6 +100,7 @@ else()
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(raylib)
+    endif()
 
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
@@ -98,34 +117,18 @@ else()
 
         set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
 
+        # With the SDL3 platform and SDL_Renderer backends (ps2_debug_panel.cpp).
         add_library(imgui STATIC
             "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
         )
-        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
-
-        FetchContent_Declare(
-            rlImGui
-            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-            GIT_TAG "Raylib_5_5"
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_GetProperties(rlImGui)
-
-        if(NOT rlimgui_POPULATED)
-            FetchContent_Populate(rlImGui)
-        endif()
-
-        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-        add_library(rlImGui STATIC
-            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-        )
-        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-        target_link_libraries(rlImGui PUBLIC raylib imgui)
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}" "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        target_link_libraries(imgui PRIVATE SDL3::SDL3-static)
     endif()
 endif()
 
@@ -234,7 +237,7 @@ if(PS2X_IS_VITA)
         c
         pthread
     )
-else()
+elseif(NOT PS2X_HOST_SDL3)
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
     if(PS2X_IS_ANDROID)
@@ -518,6 +521,12 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(PS2X_HOST_SDL3)
+    # Private: the runner's own sources do not need the host headers.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_host_sdl3.cpp)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HOST_SDL3=1)
+    target_link_libraries(ps2_runtime PRIVATE SDL3::SDL3-static)
+endif()
 if(WIN32)
     include(cmake/GpuShaders.cmake)
     ps2x_add_gpu_backend(ps2_runtime)
@@ -531,7 +540,7 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_link_libraries(ps2EntryRunner PRIVATE imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 

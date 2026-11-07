@@ -59,6 +59,9 @@ namespace ps2_stubs
             uint8_t lastData[32]{};
             uint32_t readCount = 0u;
             uint32_t lastReadDataAddr = 0u;
+            // scePadSetActAlign / scePadSetActDirect bytes; align 0xFF = byte unused.
+            uint8_t actAlign[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
+            uint8_t actDirect[6]{};
         };
 
         std::mutex g_padOverrideMutex;
@@ -230,6 +233,30 @@ namespace ps2_stubs
             portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
         }
 
+        void updateRumbleLocked(int port, int slot, const PadPortState &portState)
+        {
+#if defined(PS2X_HOST_SDL3)
+            if (port != 0 || slot != 0)
+                return;
+            float small = 0.0f;
+            float big =  0.0f;
+            for (size_t i = 0; portState.open && i < 6u; ++i)
+            {
+                if (portState.actAlign[i] == 0u && (portState.actDirect[i] & 1u) != 0u) 
+                    small = 1.0f;
+                else if (portState.actAlign[i] == 1u)
+                    big = std::max(big, portState.actDirect[i] / 255.0f);
+
+            }  
+
+            ps2HostSetRumble(small, big);
+#else
+            (void)port;
+            (void)slot;
+            (void)portState;
+#endif
+        }
+
         uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
         {
             if (!portState.pressureEnabled)
@@ -349,6 +376,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_padStateMutex);
             resetPadStateLocked();
+            updateRumbleLocked(0, 0, g_padPorts[0]);
         }
         setReturnS32(ctx, 1);
     }
@@ -570,6 +598,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_padStateMutex);
             resetPadStateLocked();
+            updateRumbleLocked(0, 0, g_padPorts[0]);
         }
         setReturnS32(ctx, 1);
     }
@@ -596,6 +625,7 @@ namespace ps2_stubs
         portState->pressureEnabled = false;
         portState->reqState = 0u;
         portState->transientState = 0u;
+        updateRumbleLocked(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)), *portState);
         setReturnS32(ctx, 1);
     }
 
@@ -620,6 +650,9 @@ namespace ps2_stubs
         portState->dmaAddr = dmaAddr;
         portState->reqState = 0u;
         portState->transientState = 0u;
+        std::memset(portState->actAlign, 0xFF, sizeof(portState->actAlign)); // padman padPortOpen.c
+        std::memset(portState->actDirect, 0, sizeof(portState->actDirect));
+        updateRumbleLocked(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)), *portState);
         if (dmaStr)
         {
             ps2TraceGuestRangeWrite(rdram, dmaAddr, 32u, "scePadPortOpen", ctx);
@@ -691,15 +724,40 @@ namespace ps2_stubs
 
     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const int slot = static_cast<int>(getRegU32(ctx, 5));
+
+        const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState =  lookupPadPortStateLocked(port, slot);
+        if (!portState || !portState->open || !align)
+        {
+            setReturnS32(ctx, 0);
+
+            return;
+        }
+         std::memcpy(portState->actAlign, align, sizeof(portState->actAlign));
+
+        updateRumbleLocked(port, slot, *portState);
         setReturnS32(ctx, 1);
     }
 
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const int slot = static_cast<int>(getRegU32(ctx, 5));
+        const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(port, slot);
+        if(!portState || !portState->open || !data)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::memcpy(portState->actDirect, data, sizeof(portState->actDirect));
+        updateRumbleLocked(port, slot, *portState);
         setReturnS32(ctx, 1);
     }
 

@@ -12,8 +12,9 @@
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
-#include "rlImGui.h"
-#include "raylib.h"
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlrenderer3.h"
+#include "ps2_host_sdl3.h"
 #endif
 
 #include <algorithm>
@@ -2144,9 +2145,13 @@ namespace
 void PS2DebugPanel::initialize()
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-    if (!m_initialized)
+    if (!m_initialized && ps2HostRenderer())
     {
-        rlImGuiSetup(true);
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark() ;
+        ImGui_ImplSDL3_InitForSDLRenderer(ps2HostWindow(), ps2HostRenderer());
+        ImGui_ImplSDLRenderer3_Init(ps2HostRenderer());
+        ps2HostSetEventHook([](const SDL_Event *event) { ImGui_ImplSDL3_ProcessEvent(event); });
         m_initialized = true;
     }
 #endif
@@ -2157,7 +2162,11 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        rlImGuiShutdown();
+        ps2HostSetEventHook(nullptr);
+        ps2HostSetUiCapture(false, false);
+        ImGui_ImplSDLRenderer3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
         m_initialized = false;
     }
 #endif
@@ -2178,10 +2187,15 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
 
     if (!m_visible)
     {
+        ps2HostSetUiCapture(false, false);
         return;
     }
 
-    rlImGuiBegin();
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();   
+    // Typing in a field or using a window does not also drive the game.
+    ps2HostSetUiCapture(ImGui::GetIO().WantCaptureKeyboard, ImGui::GetIO().WantCaptureMouse);  
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2268,7 +2282,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-    rlImGuiEnd();
+    ImGui::Render();
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ps2HostRenderer());
 #else
     (void)runtime;
 #endif
