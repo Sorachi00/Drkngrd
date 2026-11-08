@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cctype>
 
+#include "runtime/ps2_vdisc.h"
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -9,6 +11,8 @@ namespace
     struct CdFileEntry
     {
         std::filesystem::path hostPath;
+        // Set when a data folder is mounted (ps2_vdisc.h): the file's bytes.
+        PS2VDisc::FilePtr file;
         uint32_t sizeBytes = 0;
         uint32_t baseLbn = 0;
         uint32_t sectors = 0;
@@ -193,6 +197,12 @@ namespace
 
     bool tryGetCdImageTotalSectors(uint64_t &totalSectorsOut)
     {
+        if (PS2VDisc::mounted())
+        {
+            totalSectorsOut = PS2VDisc::discSectors();
+            return true;
+        }
+
         const std::filesystem::path imagePath = getCdImagePath();
         if (imagePath.empty())
         {
@@ -349,6 +359,29 @@ namespace
             return true;
         }
 
+        if (PS2VDisc::mounted())
+        {
+            // Data folder: only files of the user's disc, rebuilt from their pieces.
+            PS2VDisc::FilePtr file = PS2VDisc::find(ps2Path);
+            if (!file)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+             CdFileEntry entry;
+            entry.hostPath = file->hostPath();
+            entry.file = file;
+            entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(file->size(), 0xFFFFFFFFu));   
+            entry.baseLbn = g_nextPseudoLbn;
+            entry.sectors = sectorsForBytes(file->size());
+
+             g_nextPseudoLbn += entry.sectors + 1;
+            g_cdFilesByKey.emplace(key, entry);
+             entryOut = entry;
+            g_lastCdError = 0;
+            return true;
+        }
+
         const std::filesystem::path root = getCdRootPath();
         std::filesystem::path path = cdHostPath(ps2Path);
         std::error_code ec;
@@ -454,8 +487,28 @@ namespace
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
+            if (entry.file)
+            {
+                std::memset(dst, 0, byteCount);
+                entry.file->read(offset, dst, byteCount);
+                g_lastCdError = 0;
+                return true;
+            }
             return readHostRange(entry.hostPath, offset, dst, byteCount);
         }
+
+
+        if (PS2VDisc::mounted())
+        {
+            if (static_cast<uint64_t>(lbn) + sectors > PS2VDisc::discSectors())
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+            g_lastCdError = PS2VDisc::readDiscSectors(lbn, sectors, dst, byteCount) ? 0 : -1;
+
+            return g_lastCdError == 0;   
+         }
 
         const std::filesystem::path cdImage = getCdImagePath();
         if (!cdImage.empty())

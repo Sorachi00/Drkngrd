@@ -1,7 +1,8 @@
 #pragma once
 
+#include "runtime/ps2_vdisc.h"
+
 #include <cstdint>
-#include <filesystem>
 #include <vector>
 
 namespace PS2NativeMovie
@@ -9,7 +10,7 @@ namespace PS2NativeMovie
     // PS2_NATIVE_MOVIE=0 turns the native player off (the game's own player runs).
     bool enabled();
 
-    bool start(const std::filesystem::path &file, uint64_t offset);
+    bool start(const PS2VDisc::FilePtr &file, uint64_t offset);
     // Stops the movie (skip) or releases a finished one.
     void stop(); 
     // A movie was started and not stopped.

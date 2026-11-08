@@ -7,6 +7,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_perf.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_save_paths.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -1017,7 +1018,9 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        // Native saves (default): the cards live in the user's save folder.
+        const std::filesystem::path saveRoot = ps2NativeSaveRoot(paths.elfPath);
+        paths.mcRoot = (saveRoot.empty() ? paths.elfDirectory : saveRoot) / "mc0";
     }
     paths.cdImage = paths.elfDirectory / "disc" / "drakengard.iso";
     setIoPaths(paths);

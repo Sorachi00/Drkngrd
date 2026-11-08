@@ -58,14 +58,12 @@ namespace
     class Player   
     {
     public:
-        bool open(const std::filesystem::path &file, uint64_t offset)
+        bool open(const PS2VDisc::FilePtr &file, uint64_t offset)
         {
-            std::error_code ec;
-            const uint64_t size = std::filesystem::file_size(file, ec);
-            m_file.open(file, std::ios::binary);  
-            if (ec || !m_file || offset >= size)
+             m_file = file;
+            m_filePos = offset;
+            if (!m_file || offset >= m_file->size())
                 return false;
-            m_file.seekg(static_cast<std::streamoff>(offset));
             const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
             m_parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
             m_codec = codec ? avcodec_alloc_context3(codec) : nullptr;
@@ -167,8 +165,8 @@ namespace
                 }
                 const size_t old = m_buf.size();
                 m_buf.resize(old + kReadChunk) ;
-                m_file.read(reinterpret_cast<char *>(m_buf.data() + old), static_cast<std::streamsize>(kReadChunk));
-                const size_t got = static_cast<size_t>(m_file.gcount());
+                const size_t got = m_file->read(m_filePos, m_buf.data() + old, kReadChunk) ;
+                m_filePos += got;
                 m_buf.resize(old + got);
                 if (got == 0)   
                     return false ;
@@ -360,7 +358,8 @@ namespace
             }   
         }
 
-        std::ifstream m_file ;
+        PS2VDisc::FilePtr m_file ;
+        uint64_t m_filePos = 0;
         std::vector<uint8_t> m_buf;
         size_t m_pos = 0;
         AVCodecParserContext *m_parser = nullptr;
@@ -417,17 +416,19 @@ namespace PS2NativeMovie
         return on;
     }
 
-    bool start(const std::filesystem::path &file, uint64_t offset)
+    bool start(const PS2VDisc::FilePtr &file, uint64_t offset)   
     {
         auto p = std::make_shared<Player>();
         if(!p->open(file, offset))
         {
-            std::cerr << "[movie] cannot play " << file.string() << " at 0x" << std::hex << offset << std::dec  
-                      << std::endl;
+            std::cerr << "[movie] cannot play " << (file ? file->hostPath().string() : std::string("?"))
+                      << " at 0x" << std::hex << offset << std::dec  << std::endl;
             return false;
         }
-        std::cerr << "[movie] native player: " << file.filename().string() << " at 0x" << std::hex << offset
-                  << std::dec << std::endl;
+        std::cerr << "[movie] native player: "
+                  << (file->discName().empty() ? file->hostPath().filename().string() : file->discName())
+
+                  << " at 0x" << std::hex << offset << std::dec << std::endl;
         std::shared_ptr<Player> old; // released outside g_mutex, which readAudio takes
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -474,7 +475,7 @@ namespace PS2NativeMovie
 namespace PS2NativeMovie
 {
     bool enabled() { return false; }
-    bool start(const std::filesystem::path &, uint64_t) { return false; }
+    bool start(const PS2VDisc::FilePtr &, uint64_t) { return false; }
     void stop() {}
     bool active() { return false; }
     bool finished() { return true; }

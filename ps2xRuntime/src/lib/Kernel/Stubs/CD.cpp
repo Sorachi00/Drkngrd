@@ -240,6 +240,30 @@ namespace ps2_stubs
     }
 
 
+     bool resolveCdLbn(uint32_t lbn, PS2VDisc::FilePtr &file, uint64_t &offset)
+    {
+        // Same lookup as readCdSectors (Helpers/Support.h).
+        for (const auto &[key, entry] : g_cdFilesByKey)   
+        {
+            if (lbn >= entry.baseLbn && lbn < entry.baseLbn + entry.sectors)
+            {
+                file = entry.file ? entry.file : PS2VDisc::openHostFile(entry.hostPath);
+                offset = static_cast<uint64_t>(lbn - entry.baseLbn) * kCdSectorSize;   
+                return file != nullptr;
+            }
+        }
+        if (PS2VDisc::mounted())
+
+            return false;
+        const std::filesystem::path cdImage = getCdImagePath();
+        if (cdImage.empty())
+            return false;
+
+        file = PS2VDisc::openHostFile(cdImage);
+        offset = static_cast<uint64_t>(lbn) * kCdSectorSize;  
+        return file != nullptr;
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
@@ -925,16 +949,16 @@ namespace ps2_stubs
         PS2NativeMovie::stop();
          if (PS2NativeMovie::enabled())
         {
-            for (const auto &[key, entry] : g_cdFilesByKey)
+            PS2VDisc::FilePtr file;
+            uint64_t offset = 0;
+            if (resolveCdLbn(lbn, file, offset))
             {
-                if (lbn < entry.baseLbn || lbn >= entry.baseLbn + entry.sectors)
-                     continue;
-                std::string name = entry.hostPath.filename().string();
+                std::string name = file->discName().empty() ? file->hostPath().filename().string()
+                                                            :  file->discName();
                 std::transform(name.begin(), name.end(), name.begin(),
                                [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
                 if (name.rfind("MOVIE", 0) == 0)
-                    PS2NativeMovie::start(entry.hostPath, static_cast<uint64_t>(lbn - entry.baseLbn) * kCdSectorSize);
-                 break;
+                     PS2NativeMovie::start(file, offset);
             }
         }   
 

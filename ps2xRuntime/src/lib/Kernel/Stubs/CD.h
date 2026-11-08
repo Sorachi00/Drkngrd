@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2_stubs.h"
+#include "runtime/ps2_vdisc.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -46,6 +47,8 @@ namespace ps2_stubs
     };
 
     CdDebugSnapshot getCdDebugSnapshot();
+    // File and byte offset that hold disc sector `lbn`.
+    bool resolveCdLbn(uint32_t lbn, PS2VDisc::FilePtr &file, uint64_t &offset);
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

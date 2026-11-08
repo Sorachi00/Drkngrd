@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "runtime/ps2_vdisc.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
 #endif
@@ -173,7 +174,22 @@ int main(int argc, char *argv[])
 
     try
     {
-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        std::filesystem::path pathObj;
+#if defined(PS2X_DEFAULT_BOOT_ELF)
+        if (argc < 2)
+            pathObj = getExecutablePath(argc, argv);
+#endif
+        if (pathObj.empty())
+        {
+            // Data folder / first-run install of the user's disc (ps2_vdisc.h).
+            int bootExit = 0;
+            if (!PS2VDisc::prepareBoot(argc, argv, pathObj, bootExit))
+            {
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(bootExit);
+             }
+        }
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();

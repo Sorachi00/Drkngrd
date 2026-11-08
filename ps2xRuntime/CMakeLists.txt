@@ -452,6 +452,17 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
+target_sources(ps2_runtime PRIVATE
+    src/lib/ps2_vdisc.cpp
+    src/lib/ps2_vdisc_mods.cpp
+    src/lib/ps2_disc_install.cpp
+    src/lib/ps2_pc_formats.cpp
+    src/lib/dk_formats/dk_wzim.cpp
+    src/lib/dk_formats/dk_kps.cpp
+    src/lib/dk_formats/dk_cads.cpp
+    src/lib/ps2_save_paths.cpp
+)
+
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
