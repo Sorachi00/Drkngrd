@@ -292,9 +292,10 @@ struct GSPresentationRequest
 
 struct PresentationFrame
 {
-    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> pixels; // RGBA8 rows of `stride` pixels
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t stride = 640;
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;

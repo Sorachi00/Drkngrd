@@ -448,6 +448,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
 PS2Runtime::PS2Runtime()
 {
+    m_gs = gsCreate();
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
@@ -588,9 +589,9 @@ bool PS2Runtime::syncCoreSubsystems()
         return true;
     }
 
-    m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    m_gs->init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    { m_gs->processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu0MscalCallback([this](uint32_t startPC, bool resume)
     {
@@ -613,7 +614,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                                   *m_gs, &m_memory, startPC, top, itop, 65536);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -631,7 +632,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                                  *m_gs, &m_memory, top, itop, 65536);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -1421,7 +1422,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     copyVu0ContextToState(ctx, m_vu0.state());
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
-                  m_gs, &m_memory,
+                  *m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 4096);
     copyVu0StateToContext(m_vu0.state(), ctx);
 }
@@ -2155,12 +2156,12 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    if (m_memory.tryProcessNativeGifImageUploadChain(*m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
     }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
+    if (m_memory.tryProcessNativeGifPackedChain(*m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;

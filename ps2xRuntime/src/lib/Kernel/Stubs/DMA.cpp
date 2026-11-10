@@ -205,7 +205,7 @@ namespace ps2_stubs
     {
         const uint32_t returnPc = getRegU32(ctx, 31);
         const int32_t result = submitDmaSend(rdram, ctx, runtime, false);
-        GSPerf::recordDrakengardFrameSubmission(returnPc, result);
+        GSPerf::recordFrameSubmission(returnPc, result);
         setReturnS32(ctx, result);
     }
 

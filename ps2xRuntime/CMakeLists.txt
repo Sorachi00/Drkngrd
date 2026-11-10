@@ -388,10 +388,12 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_create.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_native_movie.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_graphics_thread.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
@@ -533,6 +535,7 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_compile_definitions(ps2_runtime PUBLIC PS2X_GS_EMULATION=1)
 if(PS2X_HOST_SDL3)
     # Private: the runner's own sources do not need the host headers.
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_sdl3.cpp)

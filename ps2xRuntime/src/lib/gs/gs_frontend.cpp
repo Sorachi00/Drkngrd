@@ -1,4 +1,12 @@
-#include "runtime/gs/gs_frontend.h"
+#include "gs_emulation.h"
+#include "runtime/gs/render_cmd.h"
+#include "runtime/gs/gs_present_queue.h"
+#include "runtime/gs/ps2_gs_common.h"
+
+#include "runtime/ps2_det.h"
+
+#include <set>
+#include "runtime/ps2_graphics_thread.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #ifdef _WIN32
 #include "runtime/gs/gs_gpu_backend.h"
@@ -6,13 +14,36 @@
 #include <cstdlib>
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_perf.h"
 #include <atomic>
+#include <map>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+
+extern std::atomic<uint64_t> g_statVu1GifBytes;    // gs_create.cpp  
+
+extern std::atomic<uint64_t> g_statPathGifBytes[4]; // gs_create.cpp
+
+namespace
+{
+    const bool g_frontendStats = [] {
+        const char *v = std::getenv("PS2_GS_FRONTEND_STATS");
+        return v && std::strcmp(v, "0") != 0; 
+    }();
+    std::atomic<uint64_t> g_statGifBytes{0}, g_statPrims{0}, g_statTransfers{0}, g_statCommands{0};
+    // PS2_GS_FRONTEND_STATS=2: also the most frequent primitive kinds.
+    const bool g_frontendKinds =  [] {
+        const char *v = std::getenv("PS2_GS_FRONTEND_STATS");
+        return v && std::strcmp(v, "2") == 0;
+    }();
+    std::mutex g_kindMutex;
+    std::map<uint64_t, uint64_t> g_kinds; // prim | ctxt | fbp | tbp | alpha -> count 
+}
+
 
 namespace
 {
@@ -25,7 +56,6 @@ namespace
 #endif
         return std::make_unique<GSCpuBackend>();
     }
-    static constexpr uint32_t kHostFrameWidth = 640u;
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -118,13 +148,13 @@ namespace
 }
 
 
-GS::GS()
+GSEmulation::GSEmulation()
     : m_backend(makeDefaultBackend())
 {
     reset();
 }
 
-void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+void GSEmulation::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
@@ -135,7 +165,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     reset();
 }
 
-void GS::reset()
+void GSEmulation::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
@@ -203,12 +233,12 @@ void GS::reset()
     }
 }
 
-GSContext &GS::activeContext()
+GSContext &GSEmulation::activeContext()
 {
     return m_ctx[m_prim.ctxt ? 1 : 0];
 }
 
-void GS::snapshotVRAM()
+void GSEmulation::snapshotVRAM()
 {
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
     // feeding the GS while a backend performs host-side conversion. Keep the
@@ -223,7 +253,7 @@ void GS::snapshotVRAM()
     m_displaySnapshot.swap(snapshot);
 }
 
-const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
+const uint8_t *GSEmulation::lockDisplaySnapshot(uint32_t &outSize)
 {
     m_snapshotMutex.lock();
     if (m_displaySnapshot.empty())
@@ -236,7 +266,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
     return m_displaySnapshot.data();
 }
 
-GSDebugSnapshot GS::getDebugSnapshot() const
+GSDebugSnapshot GSEmulation::getDebugSnapshot() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
@@ -276,7 +306,8 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     return snapshot;
 }
 
-std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
+
+std::vector<GSDebugHistoryEntry> GSEmulation::getDebugHistory() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
@@ -290,7 +321,7 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
     return out;
 }
 
-void GS::clearDebugHistory()
+void GSEmulation::clearDebugHistory()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryWrite = 0;
@@ -300,19 +331,19 @@ void GS::clearDebugHistory()
     m_debugLastVsyncTick = UINT64_MAX;
 }
 
-bool GS::isDebugHistoryPaused() const
+bool GSEmulation::isDebugHistoryPaused() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_debugHistoryPaused;
 }
 
-void GS::setDebugHistoryPaused(bool paused)
+void GSEmulation::setDebugHistoryPaused(bool paused)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryPaused = paused;
 }
 
-GSDebugHistoryEntry GS::makeDebugEventUnlocked(GSDebugEventKind kind) const
+GSDebugHistoryEntry GSEmulation::makeDebugEventUnlocked(GSDebugEventKind kind) const
 {
     GSDebugHistoryEntry entry{};
     entry.kind = kind;
@@ -333,7 +364,7 @@ GSDebugHistoryEntry GS::makeDebugEventUnlocked(GSDebugEventKind kind) const
     return entry;
 }
 
-void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
+void GSEmulation::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
 {
     if (m_debugHistoryPaused)
     {
@@ -363,7 +394,7 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
     }
 }
 
-void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg)
+void GSEmulation::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg)
 {
     if (m_debugHistoryPaused)
     {
@@ -378,7 +409,7 @@ void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+void GSEmulation::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
 {
     if (m_debugHistoryPaused)
     {
@@ -421,7 +452,7 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordDrawDebugEventUnlocked(int vertexCount)
+void GSEmulation::recordDrawDebugEventUnlocked(int vertexCount)
 {
     if (m_debugHistoryPaused)
     {
@@ -458,7 +489,7 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordTransferDebugEventUnlocked()
+void GSEmulation::recordTransferDebugEventUnlocked() 
 {
     if (m_debugHistoryPaused)
     {
@@ -470,7 +501,7 @@ void GS::recordTransferDebugEventUnlocked()
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred)
+void GSEmulation::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred)
 {
     if (m_debugHistoryPaused)
     {
@@ -486,7 +517,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
     recordDebugEventUnlocked(entry);
 }
 
-bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
+bool GSEmulation::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp ) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
@@ -501,33 +532,37 @@ bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) 
     return true;
 }
 
-void GS::unlockDisplaySnapshot()
+void GSEmulation::unlockDisplaySnapshot()
 {
     m_snapshotMutex.unlock();
 }
 
-uint32_t GS::getLastDisplayBaseBytes() const
+uint32_t GSEmulation::getLastDisplayBaseBytes() const
 {
     return m_lastDisplayBaseBytes;
 }
 
-void GS::refreshDisplaySnapshot()
+void GSEmulation::refreshDisplaySnapshot()
 {
     snapshotVRAM();
 }
 
-GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+GSPresentationRequest GSEmulation::buildPresentationRequestUnlocked() const
 {
     GSPresentationRequest request{};
     if (!m_privRegs)
         return request;
-    request.pmode = m_privRegs->pmode;
-    request.smode2 = m_privRegs->smode2;
-    request.dispfb1 = m_privRegs->dispfb1;
-    request.display1 = m_privRegs->display1;
-    request.dispfb2 = m_privRegs->dispfb2;
-    request.display2 = m_privRegs->display2;
-    request.bgcolor = m_privRegs->bgcolor;
+    uint64_t display[7]{m_privRegs->pmode, m_privRegs->smode2, m_privRegs->dispfb1, m_privRegs->display1,
+                        m_privRegs->dispfb2, m_privRegs->display2, m_privRegs->bgcolor};
+    gsLatchedDisplayRegisters(display);
+    request.pmode = display[0]; 
+    request.smode2 = display[1];
+
+    request.dispfb1 = display[2];
+    request.display1 = display[3];
+    request.dispfb2 = display[4];
+    request.display2 = display[5];  
+    request.bgcolor = display[6] ;
     request.vsyncTick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
     request.contextFrames[0] = m_ctx[0].frame;
     request.contextFrames[1] = m_ctx[1].frame;
@@ -537,8 +572,32 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame()
+void GSEmulation::latchHostPresentationFrame()
 {
+    if( g_frontendStats)
+    {
+        static uint32_t vsyncs = 0; 
+        if (++vsyncs == 600)
+        {
+            std::fprintf(stderr, "[gs-frontend] per vsync: GIF %.0f bytes (path1 %.0f path2 %.0f path3 %.0f; VU1 XGKICK %.0f), %.1f primitives, %.1f transfers, %.1f render commands\n", g_statGifBytes.exchange(0) / 600.0, g_statPathGifBytes[1].exchange(0) / 600.0, g_statPathGifBytes[2].exchange(0) / 600.0, g_statPathGifBytes[3].exchange(0) / 600.0, g_statVu1GifBytes.exchange(0) / 600.0, g_statPrims.exchange(0) / 600.0, g_statTransfers.exchange(0) / 600.0, g_statCommands.exchange(0) / 600.0);
+            if (g_frontendKinds)
+            {
+                std::vector<std::pair<uint64_t, uint64_t>> top;
+                {
+                    std::lock_guard<std::mutex> lock(g_kindMutex);
+                    top.assign(g_kinds.begin(), g_kinds.end());
+                    g_kinds.clear();
+                }
+                std::sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.second > b.second; });
+                for (size_t i = 0; i < top.size() && i < 10; ++i)
+                {
+                    const uint64_t k = top[i].first;
+                    std::fprintf(stderr, "[gs-frontend]   %6.1f/vsync prim %llu tme %llu abe %llu ctxt %llu fbp %03llX tbp %04llX alpha %02llX fix %02llX\n", top[i].second / 600.0, (unsigned long long)(k & 7), (unsigned long long)((k >> 3) & 1), (unsigned long long)((k >> 4) & 1), (unsigned long long)((k >> 5) & 1), (unsigned long long)((k >> 8) & 0x1FF), (unsigned long long)((k >> 20) & 0x3FFF), (unsigned long long)((k >> 40) & 0xFF), (unsigned long long)((k >> 48) & 0xFF));
+                }
+            }
+            vsyncs = 0;  
+        }
+    }
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -555,11 +614,22 @@ void GS::latchHostPresentationFrame()
 
     PresentationFrame frame{};
     {
+        PS2_PERF_ZONE(ZonePresent);
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
+            if (uint64_t latch[7]; gsLatchedDisplayRegisters(latch))
+            {
+                request.pmode = latch[0];
+                request.smode2 = latch[1];
+                request.dispfb1 = latch[2];
+                request.display1 = latch[3];
+                request.dispfb2 = latch[4];
+                request.display2 = latch[5];
+                request.bgcolor = latch[6];
+            }
             frame = m_backend->Present(request);
         }
     }
@@ -575,6 +645,7 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationFrame = std::move(frame.pixels);
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
+        m_hostPresentationStride = frame.stride;
         m_hostPresentationDisplayFbp = displayFbp;
         m_hostPresentationSourceFbp = sourceFbp;
         m_hostPresentationUsedPreferred = usedPreferred;
@@ -588,7 +659,7 @@ void GS::latchHostPresentationFrame()
     }
 }
 
-bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+bool GSEmulation::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp,
@@ -623,7 +694,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = static_cast<size_t>(m_hostPresentationStride) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -651,11 +722,16 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GSEmulation::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (g_frontendStats)
+        g_statGifBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
+    GraphicsThread::sync(); // EE callers (HLE); no-op on the graphics thread
+    PS2_PERF_ZONE(ZoneGif);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    PS2Det::hashGif(data, sizeBytes);
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -699,7 +775,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
 
         bool pre = ((tagLo >> 46) & 1) != 0;
-        if (pre)
+        // NLOOP == 0: every field but EOP is ignored (ps2tek "GIFtags").
+        if (pre && nloop != 0u)
         {
             writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
         }
@@ -749,7 +826,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
-bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+bool GSEmulation::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
@@ -789,7 +866,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     return true;
 }
 
-void GS::uploadImageNative(uint64_t bitbltbuf,
+void GSEmulation::uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,
                            uint64_t trxdir,
@@ -800,7 +877,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
-void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
+void GSEmulation::uploadImageNativeUnlocked(uint64_t bitbltbuf,
                                    uint64_t trxpos,
                                    uint64_t trxreg,
                                    uint64_t trxdir,
@@ -818,7 +895,7 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
     ++m_nativeImageUploadCount;
 }
 
-bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes)
+bool GSEmulation::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes )
 {
     constexpr uint32_t kSetupRegisters = 4u;
     constexpr uint32_t kPackedAdPayloadBytes = kSetupRegisters * 16u;
@@ -888,7 +965,7 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     return true;
 }
 
-void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+void GSEmulation::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 {
     switch (regDesc)
     {
@@ -1072,13 +1149,16 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     }
 }
 
-void GS::writeRegister(uint8_t regAddr, uint64_t value)
+void GSEmulation::writeRegister(uint8_t regAddr, uint64_t value)
 {
+
+    GraphicsThread::sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
 
-void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+
+void GSEmulation::writeRegisterUnlocked(uint8_t regAddr, uint64_t value )
 {
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
@@ -1269,6 +1349,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_TEX1_2) ? 1 : 0;
         m_ctx[ci].tex1 = value;
+        { // TEMP-DIAG-MIP
+            static const bool on = std::getenv("PS2_DK_MIP_LOG") != nullptr;
+            static uint32_t logged = 0;
+            if (on && ((value >> 2) & 7u) != 0u && logged < 40u)
+
+            {
+                ++logged;
+                std::fprintf(stderr, "[mip] tex1=%016llx mxl=%u mmin=%u mmag=%u lcm=%u mtba=%u l=%u k=%d\n", static_cast<unsigned long long>(value), unsigned((value >> 2) & 7), unsigned((value >> 6) & 7), unsigned((value >> 5) & 1), unsigned(value & 1), unsigned((value >> 9) & 1), unsigned((value >> 19) & 3), int(int16_t(uint16_t(((value >> 32) & 0xFFF) << 4)) >> 4));
+            }
+        }
         break;
     }
     case GS_REG_TEX2_1:
@@ -1402,7 +1492,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            PS2_PERF_ZONE(ZoneGs);
             m_backend->BeginTransfer(command);
+            if (g_frontendStats)
+                g_statTransfers.fetch_add(1, std::memory_order_relaxed);
         }
         recordTransferDebugEventUnlocked();
         break;
@@ -1424,7 +1517,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_TEXFLUSH:
         if (m_backend)
+        {
+            PS2_PERF_ZONE(ZoneGs);
             m_backend->TextureFlush();
+        }
         break;
     case GS_REG_SCANMSK:
         m_scanmsk = value;
@@ -1474,6 +1570,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
+        static bool s_signalSeen = false;
+        if (!s_signalSeen)
+        {
+            s_signalSeen =  true;
+            std::fprintf(stderr, "[gs] SIGNAL written (value 0x%llx)\n", static_cast<unsigned long long>(value));
+        }
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1489,6 +1591,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         if (m_backend)
         {
+            PS2_PERF_ZONE(ZoneGs);
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
@@ -1535,7 +1638,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
-void GS::vertexKick(bool drawing)
+
+void GSEmulation::vertexKick(bool drawing)
 {
     ++m_vtxCount;
     ++m_vtxIndex;
@@ -1587,7 +1691,21 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        PS2_PERF_ZONE(ZoneGs);
         m_backend->Submit(batch);
+        if (g_frontendStats)
+            g_statPrims.fetch_add(1, std::memory_order_relaxed);
+        if(g_frontendKinds)
+        {
+            const GSContext &kc = batch.state.context;
+            const uint64_t key = uint64_t(batch.state.prim.type) | uint64_t(batch.state.prim.tme) << 3 |
+                                uint64_t(batch.state.prim.abe) << 4 | uint64_t(batch.state.prim.ctxt) << 5 |
+                                uint64_t(kc.frame.fbp & 0x1FF) << 8 | uint64_t(kc.tex0.tbp0 & 0x3FFF) << 20 |
+                                uint64_t(kc.alpha & 0xFF) << 40 | uint64_t((kc.alpha >> 32) & 0xFF) << 48;   
+
+            std::lock_guard<std::mutex> lock(g_kindMutex);
+            ++g_kinds[key];
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1618,32 +1736,38 @@ void GS::vertexKick(bool drawing)
     }
 }
 
-void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+void GSEmulation::processImageData( const uint8_t *data, uint32_t sizeBytes)
 {
     if (m_backend)
+    {
+        PS2_PERF_ZONE(ZoneGs);
         m_backend->UploadImage(data, sizeBytes);
+    }
 }
 
 
-bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+bool GSEmulation::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    GraphicsThread::sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
-bool GS::clearActiveFramebuffer(uint32_t rgba)
+bool GSEmulation::clearActiveFramebuffer(uint32_t rgba )
 {
+    GraphicsThread::sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
-uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+uint32_t GSEmulation::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    GraphicsThread::sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
-void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+void GSEmulation::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
         backend = std::make_unique<GSCpuBackend>();
@@ -1672,20 +1796,20 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
 }
 
-uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+uint32_t GSEmulation::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
-void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+void GSEmulation::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
 }
 
-GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+GSPrimitiveBatch GSEmulation::buildDrawBatch(int vertexCount) const
 {
     GSPrimitiveBatch batch{};
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));
@@ -1712,7 +1836,7 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     return batch;
 }
 
-void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+void GSEmulation::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
@@ -1731,16 +1855,20 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     if (y0 > y1) std::swap(y0, y1);
     const int xEnd = x0 + std::max(1, x1 - x0) - 1;
     const int yEnd = y0 + std::max(1, y1 - y0) - 1;
-    const uint8_t alphaMode = static_cast<uint8_t>(ctx.alpha & 0xFFu);
-    const uint8_t alphaFix = static_cast<uint8_t>((ctx.alpha >> 32u) & 0xFFu);
+    // Drakengard's display copy (runtime/gs/ps2_gs_common.h GSGameHeuristics).
     const bool displayCopy = state.prim.tme && state.prim.abe && state.prim.fst && state.prim.ctxt &&
-                             ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
-                             (alphaFix == 0x60u || alphaFix == 0x80u) &&
-                             x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447;
+                            ctx.frame.fbp != ctx.tex0.tbp0 && GSGameHeuristics::isDisplayCopyBlend(ctx.alpha) &&
+                            x0 <= 0 && y0 <= 0 && xEnd >= GSGameHeuristics::kDisplayCopyWidth - 1 &&
+                              yEnd >= GSGameHeuristics::kDisplayCopyHeight - 1;
     if (displayCopy)
     {
         m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
     }
+}
+
+std::unique_ptr<GS> makeGsEmulation() 
+{
+    return std::make_unique<GSEmulation>();
 }

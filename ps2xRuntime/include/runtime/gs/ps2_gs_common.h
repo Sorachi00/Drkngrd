@@ -59,4 +59,30 @@ static inline uint8_t clampU8(int v)
 }
 }
 
+namespace GSGameHeuristics
+{
+constexpr int kDisplayCopyWidth = 640, kDisplayCopyHeight = 448;
+inline bool isDisplayCopyBlend(uint64_t alpha)
+{
+    const uint32_t mode = static_cast<uint32_t>(alpha & 0xFFu), fix = static_cast<uint32_t>((alpha >> 32u) & 0xFFu);
+    return mode == 0x64u && (fix == 0x60u || fix == 0x80u);   
+}
+inline bool isDeflickerBlend(uint64_t alpha)
+
+{
+    return (alpha & 0xFFu) == 0x64u && ((alpha >> 32u) & 0xFFu) == 0x40u;
+}
+
+inline bool tryContextFrames(bool preferredSource, uint32_t displayFbp)
+{
+    return !preferredSource && displayFbp == 0u;
+}
+inline bool sameFrame(const GSFrameReg &a, const GSFrameReg &b)
+{   
+    return a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm;
+}
+constexpr uint32_t kDisplayMinSize = 64, kDisplayDefaultWidth = 640, kDisplayDefaultHeight = 448,
+                   kDisplayMaxWidth = 640, kDisplayMaxHeight = 512;
+}
+
 #endif

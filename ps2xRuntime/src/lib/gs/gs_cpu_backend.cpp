@@ -1948,11 +1948,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
             return false;
 
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+        // Drakengard's black display at FBP 0 (ps2_gs_common.h GSGameHeuristics).
+        if (GSGameHeuristics::tryContextFrames(usedPreferred, displayFrame.fbp) && countNonBlackPixels(pixels, width, height) == 0u)
         {
             for (const GSFrameReg &candidate : request.contextFrames)
             {
-                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
+                if (GSGameHeuristics::sameFrame(candidate, selected))
                     continue;
                 std::vector<uint8_t> candidatePixels;
                 if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))

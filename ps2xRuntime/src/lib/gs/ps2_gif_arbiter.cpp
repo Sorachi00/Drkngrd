@@ -2,6 +2,12 @@
 #include <algorithm>
 #include <cstring>
 
+namespace
+{
+    thread_local std::vector<std::vector<uint8_t>> t_freeBuffers;
+    thread_local int t_drainDepth = 0;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -23,10 +29,28 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
+    if (pathId != GifPathId::Path3 && m_queue.empty()) 
+    {
+        struct DepthGuard 
+        {
+            DepthGuard() { ++t_drainDepth; }
+            ~DepthGuard() { --t_drainDepth; }
+        } depthGuard;
+
+        m_processFn(data, sizeBytes);
+
+        return;
+    }
+
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+    if (!t_freeBuffers.empty())
+    {
+        pkt.data = std::move(t_freeBuffers.back()) ;
+        t_freeBuffers.pop_back();
+    }
     pkt.data.resize(sizeBytes);
     std::memcpy(pkt.data.data(), data, sizeBytes);
     m_queue.push_back(std::move(pkt));
@@ -36,6 +60,11 @@ void GifArbiter::drain()
 {
     if (!m_processFn)
         return;
+    struct DepthGuard
+    {
+        DepthGuard() { ++t_drainDepth; }
+        ~DepthGuard() { --t_drainDepth; }  
+    } depthGuard;
 
     std::stable_sort(m_queue.begin(), m_queue.end(),
                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
@@ -59,6 +88,10 @@ void GifArbiter::drain()
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
+    if (t_drainDepth == 1)
+        for (auto &pkt : m_queue) 
+            if (t_freeBuffers.size() < 64u && pkt.data.capacity() != 0u)
+                t_freeBuffers.push_back(std::move(pkt.data));
     m_queue.clear();
 }
 
