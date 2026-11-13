@@ -3,6 +3,9 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_video_timing.h"
+#include "runtime/ps2_det.h"
+#include "runtime/ps2_graphics_thread.h"
+#include "../ps2_runtime_hooks.h"
 
 #include <algorithm>
 #include <cassert>
@@ -10,6 +13,19 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+
+// Game modules: called when a guest thread (or an invocation thread) starts running (ps2_runtime_hooks.h).
+namespace
+{
+    ps2_runtime_hooks::EeThreadRunFn g_ps2EeThreadRunHook = nullptr;
+}
+
+
+void ps2_runtime_hooks::setEeThreadRun(EeThreadRunFn fn)
+{
+    g_ps2EeThreadRunHook = fn;
+}
 
 namespace
 {
@@ -201,6 +217,8 @@ void EeScheduler::run()
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
+                if(g_ps2EeThreadRunHook)
+                    g_ps2EeThreadRunHook(owner->id);
                 if (getRegU32(&invocation.context, 29) == 0u)
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
@@ -440,6 +458,13 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+void EeScheduler::skipIdleToNextDeadline() noexcept
+{
+    const uint64_t next =  m_nextDeadlineCycle.load(std::memory_order_acquire );   
+    if (next > m_eeCycle)
+        accountCycles(static_cast<uint32_t>(std::min<uint64_t>(next - m_eeCycle, UINT32_MAX)));
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1782,6 +1807,8 @@ void EeScheduler::makeRunning(GuestThread &item)
     item.status = EeThreadStatus::Running;
     m_currentThreadId = item.id;
     renewTimeSlice();
+    if (g_ps2EeThreadRunHook)
+        g_ps2EeThreadRunHook(item.id);
 }
 
 void EeScheduler::makeDormant(GuestThread &item)
@@ -2046,6 +2073,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        GraphicsThread::frameBoundary();
+        PS2Det::onVBlank(m_vsyncTick);
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {

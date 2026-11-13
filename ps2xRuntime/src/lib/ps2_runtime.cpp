@@ -6,7 +6,9 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_perf.h"
+#include "runtime/ps2_graphics_thread.h"
 #include "runtime/ee_scheduler.h"
+#include "ps2_runtime_hooks.h"
 #include "runtime/ps2_save_paths.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -590,9 +592,23 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs->init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    // On the graphics thread, packets go to the GIF stage (ps2_graphics_thread.h).
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs->processGIFPacket(data, size); });
-    m_memory.setGifArbiter(&m_gifArbiter);
+                                    {
+                                        if (GraphicsThread::onThread() && GraphicsThread::gifStage())
+                                            GraphicsThread::submitGif(data, size);
+                                        else
+                                            m_gs->processGIFPacket(data, size);
+                                    });
+    GraphicsThread::setGifSink([this](const uint8_t *data, uint32_t size) { m_gs->processGIFPacket(data, size); });
+    if (m_gs->directGif())
+    {
+        GraphicsThread::disableGifStage();
+        m_memory.setGifArbiter(nullptr);
+        m_memory.setGifPacketCallback([this](const uint8_t *data, uint32_t size) { m_gs->processGIFPacket(data, size); });
+    }
+    else
+        m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu0MscalCallback([this](uint32_t startPC, bool resume)
     {
         R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -603,40 +619,74 @@ bool PS2Runtime::syncCoreSubsystems()
     });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                    R5900Context *cpuContext = nullptr;
+                                    if (!GraphicsThread::onThread()) 
+                                        cpuContext =  m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                    // On the graphics thread: the FBRST of the kick.
+                                    const uint32_t fbrst = GraphicsThread::onThread() ? GraphicsThread::jobVuControl()
+                                                                                       : cpuContext->vu0_fbrst ;
+                                    m_vu1.state().dBitEnabled =  (fbrst & (1u << 10)) != 0u;
+                                    m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    *m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                    const uint32_t stopBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                               (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                    if(GraphicsThread::onThread() )
+                                        GraphicsThread::setVuStopBits(stopBits); // applied at the next sync
+                                    else
+
+                                        cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | stopBits; });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                    R5900Context *cpuContext = nullptr ;
+                                    if (!GraphicsThread::onThread())
+                                        cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;  
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+
+                                    // On the graphics thread: the FBRST of the kick.
+                                    const uint32_t fbrst = GraphicsThread::onThread() ? GraphicsThread::jobVuControl()
+                                                                                       : cpuContext->vu0_fbrst;
+                                    m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                    m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  *m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                                  *m_gs, &m_memory, top, itop, 65536) ;
+                                      const uint32_t stopBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                               (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                    if (GraphicsThread::onThread())
+                                        GraphicsThread::setVuStopBits(stopBits); // applied at the next sync   
+                                    else
+                                        cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | stopBits; });
+    GraphicsThread::setVuControlSource([this]() -> uint32_t
+    {
+        const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+
+        return (ctx ? ctx : &m_cpuContext)->vu0_fbrst;
+    });
+    GraphicsThread::setPcSource([this]() -> uint32_t
+    {
+        const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+        return ctx ? ctx->pc : 0u;
+    });
+    GraphicsThread::setAfterSync([this]()
+    {
+        uint32_t stopBits = 0;
+        if (!GraphicsThread::takeVuStopBits(stopBits))
+            return;   
+        R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+        if (!ctx)
+            ctx = &m_cpuContext;
+        ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0x0600u) | stopBits;
+
+    });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -1303,7 +1353,12 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
-static uint64_t g_ps2GuestUnwinds = 0;
+uint64_t g_ps2GuestUnwinds = 0;
+
+uint64_t ps2_game_overrides::guestUnwindCount() noexcept
+{
+    return g_ps2GuestUnwinds;
+}
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
@@ -2161,7 +2216,9 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
         drainCompletedDmacHandlers(rdram);
         return;
     }
-    if (m_memory.tryProcessNativeGifPackedChain(*m_gs, tadr, chcr))
+
+    // Game hooks (ps2_runtime_hooks.h) need the DMA to walk GIF chains tag by tag.
+    if (!ps2_runtime_hooks::gifChainKick() && !ps2_runtime_hooks::chainTagData() && m_memory.tryProcessNativeGifPackedChain(*m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
@@ -2510,6 +2567,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    GraphicsThread::shutdown();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {

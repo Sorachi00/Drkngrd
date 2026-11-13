@@ -1929,14 +1929,14 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
-        auto &regs = runtime->memory().gs();
-        regs.pmode = env.pmode;
-        regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
-        regs.dispfb2 = env.dispfb;
-        regs.display2 = env.display;
-        regs.bgcolor = env.bgcolor;
+        auto &mem = runtime->memory();
+        mem.write64(0x12000000u, env.pmode);
+        mem.write64(0x12000020u, env.smode2);
+        mem.write64(0x12000070u, env.dispfb);
+        mem.write64(0x12000080u, env.display);
+        mem.write64(0x12000090u, env.dispfb);
+        mem.write64(0x120000A0u, env.display);
+        mem.write64(0x120000E0u, env.bgcolor);
     }
 
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)

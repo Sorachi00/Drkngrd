@@ -32,6 +32,8 @@ namespace ps2_game_overrides
     // Runtime helper for game-specific modules:
     // bind an address to an existing syscall/stub handler by name.
     bool bindAddressHandler(PS2Runtime &runtime, uint32_t address, std::string_view handlerName);
+
+    uint64_t guestUnwindCount() noexcept;
 }
 
 #define PS2_GAME_OVERRIDE_JOIN2(a, b) a##b

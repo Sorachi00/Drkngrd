@@ -1,4 +1,9 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_graphics_thread.h"
+#include "ps2_runtime_hooks.h"
+
+// A CSR read that did not wait for the graphics thread (see csrForGuestRead).
+thread_local bool t_csrUnsynced = false;
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -10,6 +15,70 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+extern std::atomic<uint64_t> g_statPathGifBytes[4]; // gs_frontend.cpp (PS2_GS_FRONTEND_STATS)
+
+// Game hooks in the DMA (ps2_runtime_hooks.h; set by drakengard_native_list.cpp).
+namespace 
+{
+    ps2_runtime_hooks::ChainKickFn g_ps2Vif1ChainKickHook = nullptr;
+
+    ps2_runtime_hooks::ChainKickFn g_ps2GifChainKickHook = nullptr;
+    ps2_runtime_hooks::DmaNormalKickFn g_ps2DmaNormalKickHook = nullptr;
+    ps2_runtime_hooks::ChainTagDataFn g_ps2ChainTagDataHook = nullptr;
+    ps2_runtime_hooks::MoviePictureFn g_ps2MoviePictureHook = nullptr;
+
+    struct DmaCall
+    {
+        uint32_t offset; // bytes into the kick's transfer
+        std::function<void()> fn;
+    };
+    std::vector<DmaCall> g_kickCalls;
+    const std::vector<uint8_t> *g_kickBuffer = nullptr;
+    struct TransferCalls
+    {
+        uint32_t channel = 0;
+        size_t index = 0;
+        std::vector<DmaCall> calls;
+    };
+    std::vector<TransferCalls> g_pendingCalls;
+    std::vector<std::pair<size_t, std::function<void()>>> g_maskedCalls;
+
+    template <typename List>
+    void attachKickCalls(uint32_t channel, List &list)
+    {
+        if ( g_kickCalls.empty()) 
+            return;
+        if (list.empty())
+            list.emplace_back(); // nothing queued: an empty transfer carries the calls  
+        g_pendingCalls.push_back({channel, list.size() - 1, std::move(g_kickCalls)});
+        g_kickCalls.clear();
+    }
+    std::vector<DmaCall> *callsOf(std::vector<TransferCalls> &all, uint32_t channel, size_t index )
+    {
+        for (auto &t : all)
+            if (t.channel == channel && t.index == index)
+                return &t.calls;
+        return nullptr;
+
+    }
+}
+
+namespace ps2_runtime_hooks
+{
+    void setVif1ChainKick(ChainKickFn fn) { g_ps2Vif1ChainKickHook = fn; }
+    void setGifChainKick(ChainKickFn fn) { g_ps2GifChainKickHook = fn; }
+    void setDmaNormalKick(DmaNormalKickFn fn) { g_ps2DmaNormalKickHook = fn; }
+    void setChainTagData(ChainTagDataFn fn) { g_ps2ChainTagDataHook = fn; }
+    ChainKickFn gifChainKick() { return g_ps2GifChainKickHook; }
+    ChainTagDataFn chainTagData() { return g_ps2ChainTagDataHook; }
+    void setMoviePicture(MoviePictureFn fn) { g_ps2MoviePictureHook = fn; }
+    MoviePictureFn moviePicture() { return g_ps2MoviePictureHook; }
+    void dmaInsert(std::function<void()> atGif)
+    {
+        g_kickCalls.push_back({g_kickBuffer ? uint32_t(g_kickBuffer->size()) : 0u, std::move(atGif)});  
+    }
+}
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -41,6 +110,40 @@ namespace
         {
             throw std::runtime_error(std::string(op) + " out-of-bounds at address: 0x" + std::to_string(address));
         }
+    }
+
+    thread_local std::vector<uint8_t> t_spareDmaChain;
+
+
+    // Buffers of transfers that ran on the graphics thread come back here.
+    std::mutex g_sharedSpareMutex;
+    std::vector<std::vector<uint8_t>> g_sharedSpares;
+
+    std::vector<uint8_t> takeSpareDmaChainBuffer()
+    {
+
+        std::vector<uint8_t> buffer = std::move(t_spareDmaChain);
+        t_spareDmaChain = {};
+        if(buffer.capacity() == 0 && GraphicsThread::active())
+        {
+
+            std::lock_guard<std::mutex> lock(g_sharedSpareMutex);
+            if (!g_sharedSpares.empty())
+            {
+                buffer = std::move(g_sharedSpares.back());
+                g_sharedSpares.pop_back();
+            }
+        }
+        buffer.clear();
+        return buffer;
+    }
+
+    template <typename Transfers>
+    void recycleDmaChainBuffers(Transfers &transfers)
+    {
+        for (auto &transfer : transfers)
+            if (transfer.chainData.capacity() > t_spareDmaChain.capacity())
+                t_spareDmaChain = std::move(transfer.chainData);
     }
 
     template <typename T>
@@ -121,6 +224,17 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+
+    inline uint64_t csrForGuestRead(uint64_t raw)
+    {
+        if (t_csrUnsynced)
+
+        {
+            t_csrUnsynced = false;
+            raw &= ~3ull;
+        }
+        return raw;
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -692,6 +806,8 @@ int32_t PS2Memory::tlbProbe(uint32_t vpn) const
 
 uint8_t PS2Memory::read8(uint32_t address)
 {
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        t_csrUnsynced = !GraphicsThread::syncFor(address, false);
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
@@ -723,6 +839,8 @@ uint8_t PS2Memory::read8(uint32_t address)
 
 uint16_t PS2Memory::read16(uint32_t address)
 {
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        t_csrUnsynced = !GraphicsThread::syncFor(address, false);
     if (address & 1)
     {
         throw std::runtime_error("Unaligned 16-bit read at address: 0x" + std::to_string(address));
@@ -758,6 +876,8 @@ uint16_t PS2Memory::read16(uint32_t address)
 
 uint32_t PS2Memory::read32(uint32_t address)
 {
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))   
+        t_csrUnsynced = !GraphicsThread::syncFor(address, false);
     if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit read at address: 0x" + std::to_string(address));
@@ -769,7 +889,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            uint64_t val = gs_regs.csr.load();
+            uint64_t val =  csrForGuestRead(gs_regs.csr.load());
             return (uint32_t)(val >> (off * 8));
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -806,6 +926,8 @@ uint32_t PS2Memory::read32(uint32_t address)
 
 uint64_t PS2Memory::read64(uint32_t address)
 {
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        t_csrUnsynced = !GraphicsThread::syncFor(address, false);
     if (address & 7)
     {
         throw std::runtime_error("Unaligned 64-bit read at address: 0x" + std::to_string(address));
@@ -816,7 +938,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return gs_regs.csr.load();
+            return csrForGuestRead(gs_regs.csr.load());
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
@@ -853,6 +975,8 @@ uint64_t PS2Memory::read64(uint32_t address)
 
 __m128i PS2Memory::read128(uint32_t address)
 {
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        t_csrUnsynced =  !GraphicsThread::syncFor(address, false);
     if (address & 15)
     {
         throw std::runtime_error("Unaligned 128-bit read at address: 0x" + std::to_string(address));
@@ -886,6 +1010,10 @@ __m128i PS2Memory::read128(uint32_t address)
 
 void PS2Memory::write8(uint32_t address, uint8_t value)
 {
+    if(isGsPrivReg(address) && GraphicsThread::deferPrivWrite([this, address, value] { write8(address, value); }))
+        return;
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        GraphicsThread::syncFor(address, true);
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
@@ -925,6 +1053,10 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
 
 void PS2Memory::write16(uint32_t address, uint16_t value)
 {
+    if (isGsPrivReg(address) && GraphicsThread::deferPrivWrite([this, address, value] { write16(address, value); }))
+        return;
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        GraphicsThread::syncFor(address, true); 
     if (address & 1)
     {
         throw std::runtime_error("Unaligned 16-bit write at address: 0x" + std::to_string(address));
@@ -967,6 +1099,10 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
 
 void PS2Memory::write32(uint32_t address, uint32_t value)
 {
+    if (isGsPrivReg(address) && GraphicsThread::deferPrivWrite([this, address, value] { write32(address, value); }))
+        return;
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address)) 
+        GraphicsThread::syncFor(address, true);
     if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit write at address: 0x" + std::to_string(address));
@@ -1027,6 +1163,10 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
 void PS2Memory::write64(uint32_t address, uint64_t value)
 {
+    if (isGsPrivReg(address) && GraphicsThread::deferPrivWrite([this, address, value] { write64(address, value); }))
+        return;
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        GraphicsThread::syncFor(address, true);
     if (address & 7)
     {
         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
@@ -1083,6 +1223,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
 void PS2Memory::write128(uint32_t address, __m128i value)
 {
+    if(isGsPrivReg(address) && GraphicsThread::deferPrivWrite([this, address, value] { write128(address, value); }))
+        return;
+    if (GraphicsThread::active() && GraphicsThread::isGraphicsAddress(address))
+        GraphicsThread::syncFor(address, true);
     if (address & 15)
     {
         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
@@ -1119,13 +1263,14 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     if ((physAddr & ~0xFFFu) == 0x10004000u || (physAddr & ~0xFFFu) == 0x10005000u)
     {
-        // VIF0/VIF1 FIFO: the quadword goes to the VIF like DMA data (real PS2: dma/vif/basic).
-        alignas(16) uint8_t bytes[16];
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(bytes), value);
+        alignas(16) std::array<uint8_t, 16> bytes;
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(bytes.data()), value);
         if ((physAddr & ~0xFFFu) == 0x10004000u)
-            processVIF0Data(bytes, 16u);
+            processVIF0Data(bytes.data(), 16u);
+        else if ( GraphicsThread::active())
+            GraphicsThread::submit([this, bytes] { processVIF1Data(bytes.data(), 16u); });
         else
-            processVIF1Data(bytes, 16u);
+            processVIF1Data(bytes.data(), 16u);
         return;
     }
     if (isIoRegister(physAddr))
@@ -1136,6 +1281,128 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
         write64(address, lo);
         write64(address + 8, hi);
+    }
+}
+
+void completeDmaTransfers(PS2Memory &mem, bool hadGif, bool hadVif0, bool hadVif1);
+
+namespace
+{
+    void runDmaCall(PS2Memory &mem, std::function<void()> fn, bool path3)
+    {
+        if (path3 && mem.m_path3Masked)
+        {
+            g_maskedCalls.emplace_back(mem.m_path3MaskedFifo.size(), std::move(fn));
+            return;
+        }
+        if (mem.m_gifArbiter)
+            mem.m_gifArbiter->drain();
+        GraphicsThread::gifCall(std::move(fn));
+    }
+    template <typename Feed>   
+    void feedWithCalls(PS2Memory &mem, const uint8_t *data, uint32_t size, std::vector<DmaCall> *calls, bool path3,
+
+                       Feed &&feed)
+    {
+        uint32_t pos = 0;
+        if (calls)
+        {
+            std::stable_sort(calls->begin(), calls->end(), [](const DmaCall &a, const DmaCall &b) { return a.offset < b.offset; });
+            for (DmaCall &c : *calls)
+            {
+                const uint32_t at = std::min(c.offset, size);
+                if (at > pos)
+                {
+                    feed(data + pos, at - pos );
+                    pos = at;
+                }
+                runDmaCall(mem, std::move(c.fn), path3);  
+            }
+        }
+        if (pos < size)
+            feed(data + pos, size - pos);
+    }
+
+    void materializeTransfer(PS2Memory &mem, PS2Memory::PendingTransfer &pt)
+    {
+        if (!pt.chainData.empty() || pt.qwc == 0)
+            return;
+        uint32_t src = 0;
+        try
+        {
+            src = mem.translateAddress(pt.srcAddr);
+        }
+        catch (const std::exception &)
+        {
+            return;
+        }
+        const uint8_t *base = pt.fromScratchpad ? mem.m_scratchpad : mem.m_rdram;
+
+        const uint32_t limit = pt.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        uint32_t left = static_cast<uint32_t>(std::min<uint64_t>(uint64_t(pt.qwc) * 16ull, 0xFFFFFFFFull));
+        pt.chainData = takeSpareDmaChainBuffer();
+        while (left >= 16)
+        {
+            if (src >= limit)
+                src = 0;
+            const uint32_t chunk = std::min(left, limit - src);
+            pt.chainData.insert(pt.chainData.end(), base + src, base + src + chunk);
+            left -= chunk ;
+            src += chunk;
+        }   
+    }
+
+    struct GraphicsTransfers
+    {
+        std::vector<PS2Memory::PendingTransfer> gif, vif1;
+        std::vector<TransferCalls> calls;
+    };
+
+    // Graphics thread: the GIF and VIF1 part of processPendingTransfers.
+    void runGraphicsTransfers(PS2Memory &mem, GraphicsTransfers &job)
+    {
+        for ( size_t i = 0; i < job.gif.size(); ++i)
+        {
+            auto &p = job.gif[i];
+            feedWithCalls(mem, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), callsOf(job.calls, 2, i), true,
+                          [&](const uint8_t *d, uint32_t n) {
+
+                              mem.m_seenGifCopy = true;
+                              mem.m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                              mem.submitGifPacket(GifPathId::Path3, d, n, false);
+                          });
+        }
+        for (size_t i = 0; i < job.vif1.size(); ++i)
+        {
+            auto &p =  job.vif1[i];
+            feedWithCalls(mem, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), callsOf(job.calls, 1, i), false, [&](const uint8_t *d, uint32_t n) { mem.processVIF1Data(d, n); });
+        }
+        if (mem.m_gifArbiter)
+            mem.m_gifArbiter->drain();
+        std::lock_guard<std::mutex> lock(g_sharedSpareMutex);
+        for(auto *list : {&job.gif, &job.vif1})
+            for (auto &p : *list)
+                if (p.chainData.capacity() && g_sharedSpares.size() < 8)
+                    g_sharedSpares.push_back(std::move(p.chainData)) ;
+    }
+
+    void queueGraphicsTransfers(PS2Memory &mem)
+    {
+        auto job = std::make_shared<GraphicsTransfers>();
+        job->gif = std::move(mem.m_pendingGifTransfers);
+        job->vif1 = std::move(mem.m_pendingVif1Transfers );
+        job->calls = std::move(g_pendingCalls);
+        mem.m_pendingGifTransfers.clear();
+        mem.m_pendingVif1Transfers.clear();
+        g_pendingCalls.clear();
+        for (auto &p : job->gif)
+            materializeTransfer(mem, p);
+        for (auto &p : job->vif1)
+            materializeTransfer(mem, p);
+        const bool hadGif = !job->gif.empty(), hadVif1 = !job->vif1.empty();
+        if ( hadGif || hadVif1)
+            GraphicsThread::submit([&mem, job] { runGraphicsTransfers(mem, *job); });
+        completeDmaTransfers(mem, hadGif, false, hadVif1);
     }
 }
 
@@ -1268,8 +1535,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
                 if (m_vifStalled[1])
                 {
+                    // The stalled data continues.
                     m_vifStalled[1] = false;
-                    processVIF1Data(nullptr, 0u); // the stalled data continues
+                    if (GraphicsThread::active())
+                        GraphicsThread::submit([this] { processVIF1Data(nullptr, 0u); });
+                    else
+
+                        processVIF1Data(nullptr, 0u);
                 }
             }
             break;
@@ -1484,7 +1756,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                (m_gsVRAM || channelBase == 0x10008000u))
+                (m_rdram || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
@@ -1508,13 +1780,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 if (mode == 0 && qwc > 0)
                 {
-                    enqueueTransfer(madr, qwc);
-                    // Normal mode ends with MADR past the data and QWC = 0 (real PS2: dma/vif/basic).
+                    uint32_t sendQwc = qwc;  
+                    if (g_ps2DmaNormalKickHook && (channelBase == 0x10009000u || channelBase == 0x1000A000u))
+                        sendQwc = g_ps2DmaNormalKickHook(m_rdram, channelBase == 0x10009000u ? 1u : 2u, madr, qwc);
+                    enqueueTransfer(madr, sendQwc);
+                    if (channelBase == 0x10009000u)
+                        attachKickCalls( 1, m_pendingVif1Transfers);
+
+                    else if (channelBase == 0x1000A000u)
+                        attachKickCalls(2, m_pendingGifTransfers);
                     m_ioRegisters[channelBase + 0x10] = madr + qwc * 16u;
                     m_ioRegisters[channelBase + 0x20] = 0u;
                 }
                 else if (mode == 1)
                 {
+                    if (channelBase == 0x10009000u && g_ps2Vif1ChainKickHook)
+                        g_ps2Vif1ChainKickHook(m_rdram, m_ioRegisters[channelBase + 0x30]);
+                    if (channelBase == 0x1000A000u && g_ps2GifChainKickHook)
+                        g_ps2GifChainKickHook(m_rdram, m_ioRegisters[channelBase + 0x30]) ;
                     uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
@@ -1522,7 +1805,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     // PAL movie initialization submits about 4600 tile-upload tags.
                     const int kMaxChainTags = 16384;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeSpareDmaChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1577,6 +1860,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    g_kickBuffer = &chainBuf; // dmaInsert offsets
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1690,16 +1974,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         const bool tagToVif =
                             (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                             ((chcr & 0x40u) || id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (tagToVif)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
-                        if (hasPayload)
-                            appendData(dataAddr, tagQwc);
+                        const std::vector<uint8_t> *tagData =   
+                            g_ps2ChainTagDataHook && (channelBase == 0x10009000u || channelBase == 0x1000A000u)
+                                ? g_ps2ChainTagDataHook(channelBase == 0x10009000u ? 1u : 2u, uint32_t(tagsProcessed - 1), currentTagAddr, tagToVif)
+                                : nullptr;
+                        if (tagData)
+                            chainBuf.insert(chainBuf.end(), tagData->begin(), tagData->end()) ;
+                        else
+                        {
+                            if (tagToVif)
+                                appendCompactVif1TagData(currentTagAddr, 0u);
+                            if (hasPayload)
+                                appendData(dataAddr, tagQwc);
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
                             break;
                     }
 
+                    g_kickBuffer = nullptr;
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
@@ -1727,10 +2021,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
-                    // else if (channelBase == 0x10009000u)
-                    // {
-
-                    // }
+                    if (channelBase == 0x10009000u)
+                        attachKickCalls( 1, m_pendingVif1Transfers);
+                    else if (channelBase == 0x1000A000u)
+                        attachKickCalls(2, m_pendingGifTransfers);
                 }
                 else if (qwc > 0)
                 {
@@ -1741,7 +2035,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
                 if (autoProcessTransfers)
                 {
-                    processPendingTransfers();
+                    if (GraphicsThread::active() && channelBase != 0x10008000u)
+                        queueGraphicsTransfers(*this);
+                    else
+                        processPendingTransfers();
                 }
             }
         }
@@ -1765,15 +2062,30 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
 void PS2Memory::processPendingTransfers()
 {
+    if (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty() )
+        GraphicsThread::sync();
+    std::vector<TransferCalls> calls = std::move(g_pendingCalls);
+    g_pendingCalls.clear();
+    auto callsFirst = [&](std::vector<DmaCall> *c, bool path3) {
+        if(c)
+            for (DmaCall &call : *c)
+                runDmaCall(*this, std::move(call.fn), path3);
+    };
     const bool hadGif = !m_pendingGifTransfers.empty();
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        std::vector<DmaCall> *c = callsOf(calls, 2, idx);
+        if (p.chainData.empty())
+            callsFirst(c, true); // a normal-mode block: before it
         if (!p.chainData.empty())
         {
-            m_seenGifCopy = true;
-            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+            feedWithCalls(*this, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), c, true,
+                          [&](const uint8_t *d, uint32_t n) {
+                              m_seenGifCopy = true;
+                              m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                              submitGifPacket(GifPathId::Path3, d, n, false); 
+                          });
         }
         else if (p.qwc > 0)
         {
@@ -1828,6 +2140,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -1886,14 +2199,19 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    for (size_t idx = 0; idx < m_pendingVif1Transfers.size(); ++idx)
     {
+        auto &p = m_pendingVif1Transfers[idx];
+        std::vector<DmaCall> *c = callsOf(calls, 1, idx);
+        if (p.chainData.empty())
+            callsFirst(c, false); // a normal-mode block: before it
         if (!p.chainData.empty())
         {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            feedWithCalls(*this, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), c, false, [&](const uint8_t *d, uint32_t n) { processVIF1Data(d, n); });
         }
         else if (p.qwc > 0)
         {
@@ -1944,11 +2262,21 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleDmaChainBuffers(m_pendingVif1Transfers);
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    // Only GIF and VIF1 data reach the arbiter (the graphics thread owns it).   
+    if (m_gifArbiter && (hadGif || hadVif1))
         m_gifArbiter->drain();
 
+    completeDmaTransfers(*this, hadGif, hadVif0, hadVif1);
+}
+
+void completeDmaTransfers(PS2Memory &mem, bool hadGif, bool hadVif0, bool hadVif1)
+
+{
+    auto &m_ioRegisters = mem.m_ioRegisters;
+    auto queueCompletedDmacCause = [&](uint32_t cause) { mem.queueCompletedDmacCause(cause); };
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
@@ -2008,7 +2336,8 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
 
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
-    if (m_path3Masked || m_path3MaskedFifo.empty())
+
+    if(m_path3Masked || (m_path3MaskedFifo.empty() && g_maskedCalls.empty()))   
         return;
 
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
@@ -2019,11 +2348,25 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
             m_gifPacketCallback(packetData, packetSize);
     };
 
-    for (const auto &packet : m_path3MaskedFifo)
+    // DMA insertions held with the data (runDmaCall) go where they were.   
+    size_t call = 0;
+    auto callsUpTo = [&](size_t packets) {
+        for(; call < g_maskedCalls.size() && g_maskedCalls[call].first <= packets; ++call)
+        {
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
+            GraphicsThread::gifCall(std::move(g_maskedCalls[call].second));
+        }
+    };
+    for(size_t i = 0; i < m_path3MaskedFifo.size(); ++i)
     {
+        callsUpTo(i);  
+        const auto &packet = m_path3MaskedFifo[i];
         if (packet.size() >= 16u)
             emit(packet.data(), static_cast<uint32_t>(packet.size()));
     }
+    callsUpTo(m_path3MaskedFifo.size());
+    g_maskedCalls.clear();
     m_path3MaskedFifo.clear();
 
     if (m_gifArbiter && drainImmediately)
@@ -2034,6 +2377,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+    g_statPathGifBytes[static_cast<int>(pathId) & 3].fetch_add(sizeBytes, std::memory_order_relaxed); // PS2_GS_FRONTEND_STATS
 
     if (pathId == GifPathId::Path3)
     {
@@ -2094,7 +2438,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
+    if (!m_rdram || m_path3Masked)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
@@ -2282,11 +2626,12 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    GraphicsThread::sync();
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
-    if (!m_rdram || !m_gsVRAM || m_path3Masked)
+    if (!m_rdram || m_path3Masked)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
         return false;
@@ -2395,7 +2740,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
+            return static_cast<uint32_t>((csrForGuestRead(gs_regs.csr.load()) >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {

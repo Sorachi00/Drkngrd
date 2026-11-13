@@ -277,6 +277,8 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    // Guest idle loops: EE time jumps to the next scheduled event.
+    void skipIdleToNextDeadline() noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -332,6 +334,8 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // EE cycles accounted so far (guest work, not host time).
+    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
