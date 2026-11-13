@@ -7,6 +7,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_perf.h"
 #include "runtime/ps2_graphics_thread.h"
+#include "runtime/ps2_display_clock.h"
 #include "runtime/ee_scheduler.h"
 #include "ps2_runtime_hooks.h"
 #include "runtime/ps2_save_paths.h"
@@ -738,6 +739,7 @@ bool PS2Runtime::initialize(const char *title)
             return nullptr; },
                                          IsAudioDeviceReady());
 #endif
+        PS2DisplayClock::setWindow(GetWindowHandle());
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -2568,6 +2570,7 @@ void PS2Runtime::run()
         gameThread.join();
     }
     GraphicsThread::shutdown();
+    PS2DisplayClock::shutdown();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {

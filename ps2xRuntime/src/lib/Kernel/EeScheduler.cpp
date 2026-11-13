@@ -6,6 +6,7 @@
 #include "runtime/ps2_det.h"
 #include "runtime/ps2_graphics_thread.h"
 #include "../ps2_runtime_hooks.h"
+#include "runtime/ps2_display_clock.h"
 
 #include <algorithm>
 #include <cassert>
@@ -25,6 +26,46 @@ namespace
 void ps2_runtime_hooks::setEeThreadRun(EeThreadRunFn fn)
 {
     g_ps2EeThreadRunHook = fn;
+}
+
+#if defined(_WIN32)
+// winmm (timeapi.h), declared here: <windows.h> macros clash with this file.
+extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int period);
+#pragma comment(lib, "winmm.lib")
+#endif
+
+void gsLatchDisplayRegisters(const GSRegisters &regs); // gs_create.cpp
+
+namespace
+{
+    // The display registers the next picture shows, at this point of the GS stream.
+    void latchDisplay( GSRegisters &regs)
+    {
+        if (!GraphicsThread::deferPrivWrite([&regs] { gsLatchDisplayRegisters(regs); }))
+            gsLatchDisplayRegisters(regs);
+    }
+
+    // A timed wait on Windows wakes up 1-2 ms late: sleep until shortly before the deadline, then yield.
+    template <typename Pred>
+    bool preciseWaitUntil(std::condition_variable &cv, std::unique_lock<std::mutex> &lock, std::chrono::steady_clock::time_point deadline, Pred pred)
+    {  
+#if defined(_WIN32)
+        static const bool s_timerPeriod = (timeBeginPeriod(1u), true);   
+        (void)s_timerPeriod;
+#endif
+
+        const auto coarse = deadline - std::chrono::microseconds(2000);
+        if (std::chrono::steady_clock::now() < coarse && cv.wait_until(lock, coarse, pred))
+            return true;
+        while (!pred() && std::chrono::steady_clock::now() < deadline)
+        {
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+        }
+        return pred();
+
+    }
 }
 
 namespace
@@ -268,6 +309,9 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                // A vsync callback flips buffers in the vblank: the new one is shown from now on.
+                if(completed.kind == GuestInvocationKind::GsCallback )
+                    latchDisplay(m_runtime.memory().gs());
                 if (completed.onComplete)
                 {
                     try
@@ -2001,7 +2045,7 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                preciseWaitUntil(m_eventCv, lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
@@ -2055,8 +2099,10 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               deliveredAt + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                // At the monitor's refresh rate, the next vblank goes on the monitor's grid (ps2_display_clock.h).
+                const auto nextVBlank = PS2DisplayClock::lockVBlank(deliveredAt + vblankPeriod(), PS2VideoTiming::fieldsPerSecond());
                 scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
-                              deliveredAt + vblankPeriod(),
+                              nextVBlank,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2113,6 +2159,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         completeExternalWait(event.id, event.value, KE_OK);
         break;
     case EeEventType::VBlankEnd:
+        latchDisplay(m_runtime.memory().gs());
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
@@ -2245,7 +2292,7 @@ void EeScheduler::waitForEvent()
         }
     }
 
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+    const bool signaled = preciseWaitUntil(m_eventCv, lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
     if (!signaled)

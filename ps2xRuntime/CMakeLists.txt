@@ -393,6 +393,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_native_movie.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_display_clock.cpp
     src/lib/ps2_graphics_thread.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
